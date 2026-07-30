@@ -46,7 +46,7 @@ SETUP INSTRUCTIONS
 --------------------------------------------------------------------------------
 1. Requirements (requirements.txt):
      streamlit
-     gspread
+     requests
      google-auth
      google-api-python-client
      pandas
@@ -62,15 +62,85 @@ SETUP INSTRUCTIONS
    briefings show a placeholder message, notice generation is disabled with
    a clear error) and the rest of the app keeps working.
 
-2. Create a Google Cloud service account with the Sheets API and Drive API
-   enabled. Download its JSON key.
+   NOTE: `gspread` has been removed — the database layer below no longer
+   talks to the Sheets API directly. `google-auth` / `google-api-python-client`
+   are still required, but now only for the Google Drive folder-scaffolding
+   and file-upload features (create_case_folder_structure,
+   upload_bytes_to_drive_folder, etc.), which are unchanged from before.
 
-3. Share edit access with that service account's email on:
-     - The Google Drive location where you want "HYDRA_Cases" folder created
-       (or just let it create folders in the service account's own Drive).
-     - Any pre-existing Google Sheets you want it to reuse.
+2. CREDENTIAL-FREE DATABASE (Google Sheets, via CSV export + Apps Script) ---
 
-4. Add the service account credentials to .streamlit/secrets.toml:
+   Instead of a service account + gspread, the "database" (User_Whitelist,
+   HYDRA_Cases, Audit_Logs, Unassigned_Scans) is now a single Google Sheet
+   with four tabs, read via the public CSV export endpoint and written to
+   via a small Google Apps Script Web App you deploy from that same Sheet.
+   No Google Cloud Console project or service account is needed for this
+   part.
+
+   a) Create one Google Sheet with four tabs, named EXACTLY:
+        User_Whitelist, HYDRA_Cases, Audit_Logs, Unassigned_Scans
+      Give each tab a header row matching (in any order — the app reads
+      columns by name) the constants below in this file:
+        User_Whitelist  -> WHITELIST_HEADERS
+        HYDRA_Cases     -> CASES_HEADERS
+        Audit_Logs      -> AUDIT_HEADERS
+        Unassigned_Scans -> UNASSIGNED_HEADERS
+      Add at least one row to User_Whitelist so you can log in, e.g.:
+        gmail_id             | role  | department | name
+        head@example.com     | Head  | HYDRA HQ   | Jane Doe
+
+   b) Share the Sheet as "Anyone with the link — Viewer" (required so
+      pd.read_csv can fetch the gviz CSV export with no auth).
+
+   c) In the same Sheet, open Extensions -> Apps Script and paste a Web
+      App that accepts POST requests shaped like:
+        {"action": "append",  "sheetName": "<tab>", "rowData": {col: val, ...}}
+        {"action": "update",  "sheetName": "<tab>", "matchColumn": "<col>",
+         "matchValue": "<val>", "rowData": {col: val, ...}}
+      "append" should add a new row (matching columns to the tab's header
+      row, in any order). "update" should find the first row where
+      matchColumn == matchValue and overwrite only the columns present in
+      rowData, leaving every other column untouched. A minimal example:
+
+        function doPost(e) {
+          var body = JSON.parse(e.postData.contents);
+          var ss = SpreadsheetApp.getActiveSpreadsheet();
+          var sheet = ss.getSheetByName(body.sheetName);
+          var headers = sheet.getRange(1, 1, 1, sheet.getLastColumn()).getValues()[0];
+
+          if (body.action === "append") {
+            var newRow = headers.map(function(h) { return body.rowData[h] !== undefined ? body.rowData[h] : ""; });
+            sheet.appendRow(newRow);
+          } else if (body.action === "update") {
+            var data = sheet.getDataRange().getValues();
+            var matchColIdx = headers.indexOf(body.matchColumn);
+            for (var r = 1; r < data.length; r++) {
+              if (String(data[r][matchColIdx]) === String(body.matchValue)) {
+                Object.keys(body.rowData).forEach(function(col) {
+                  var colIdx = headers.indexOf(col);
+                  if (colIdx !== -1) sheet.getRange(r + 1, colIdx + 1).setValue(body.rowData[col]);
+                });
+                break;
+              }
+            }
+          }
+          return ContentService.createTextOutput(JSON.stringify({ok: true}))
+            .setMimeType(ContentService.MimeType.JSON);
+        }
+
+      Deploy it (Deploy -> New deployment -> Web app), execute as yourself,
+      access "Anyone", and copy the resulting Web App URL.
+
+   d) Add both URLs to .streamlit/secrets.toml:
+
+        DATABASE_URL = "https://docs.google.com/spreadsheets/d/<YOUR_SHEET_ID>"
+        WRITE_API_URL = "https://script.google.com/macros/s/<YOUR_DEPLOYMENT_ID>/exec"
+
+3. GOOGLE DRIVE (unchanged) — folder scaffolding and document/notice-PDF
+   uploads still use a Google Cloud service account with the Drive API
+   enabled, since Drive has no simple credential-free write path. Create
+   the service account, enable the Drive API, share the target Drive
+   location with its email, and add its JSON key to secrets.toml:
 
      [gcp_service_account]
      type = "service_account"
@@ -92,16 +162,9 @@ SETUP INSTRUCTIONS
      [gemini]
      api_key = "your-google-ai-studio-api-key"
 
-5. On first run, the app will create (if missing) four Google Sheets owned
-   by the service account: "User_Whitelist", "HYDRA_Cases", "Audit_Logs",
-   "Unassigned_Scans". Open "User_Whitelist" and add at least one row so you
-   can log in, e.g.:
-     gmail_id             | role  | department | name
-     head@example.com     | Head  | HYDRA HQ   | Jane Doe
+4. Run:  streamlit run app.py
 
-6. Run:  streamlit run app.py
-
-7. Standalone PDF splitter (no Streamlit needed):
+5. Standalone PDF splitter (no Streamlit needed):
      python app.py --split-pdf /path/to/giant_scan.pdf /path/to/output_dir
 --------------------------------------------------------------------------------
 """
@@ -114,7 +177,7 @@ from datetime import datetime, date
 
 import streamlit as st
 import pandas as pd
-import gspread
+import requests
 from google.oauth2.service_account import Credentials
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseUpload
@@ -162,7 +225,6 @@ except ImportError:
 APP_TITLE = "HYDRA Case & Document Manager"
 
 SCOPES = [
-    "https://www.googleapis.com/auth/spreadsheets",
     "https://www.googleapis.com/auth/drive",
 ]
 
@@ -357,15 +419,6 @@ def get_credentials():
 
 
 @st.cache_resource(show_spinner=False)
-def get_gspread_client():
-    try:
-        return gspread.authorize(get_credentials())
-    except Exception as exc:  # noqa: BLE001
-        st.error(f"Failed to authorize Google Sheets client: {exc}")
-        st.stop()
-
-
-@st.cache_resource(show_spinner=False)
 def get_drive_service():
     try:
         return build("drive", "v3", credentials=get_credentials(), cache_discovery=False)
@@ -394,180 +447,162 @@ def get_gemini_model():
 # --------------------------------------------------------------------------------
 # SHEET / DATABASE HELPERS
 # --------------------------------------------------------------------------------
+# Credential-free replacement for the old gspread/service-account layer:
+#   - READS go straight to the public CSV export of each tab in the shared
+#     Google Sheet (`read_sheet`) via pandas.
+#   - WRITES (both brand-new rows and in-place field updates) are POSTed as
+#     JSON to a single Google Apps Script Web App URL (`write_sheet` /
+#     `update_sheet_row`). See the SETUP INSTRUCTIONS docstring above for the
+#     exact Apps Script contract this expects.
+#
+# Every other function in this file (load_whitelist, load_cases,
+# append_case_row, update_case_fields, append_audit_entry,
+# load_unassigned_scans, append_unassigned_scan, update_unassigned_fields)
+# keeps its original name and signature — callers throughout the app are
+# unaffected by this swap. The `*_ws` parameter names are kept too, but now
+# simply hold the plain tab-name string (e.g. "HYDRA_Cases") instead of a
+# gspread Worksheet object.
 
-def get_or_create_spreadsheet(client, name):
+
+def read_sheet(sheet_name):
+    """Read one tab of the shared Google Sheet as a DataFrame via its public
+    CSV export — no credentials required. The Sheet must be shared as
+    "Anyone with the link can view"."""
     try:
-        return client.open(name)
-    except gspread.SpreadsheetNotFound:
-        sh = client.create(name)
-        return sh
+        url = f"{st.secrets['DATABASE_URL']}/gviz/tq?tqx=out:csv&sheet={sheet_name}"
+        return pd.read_csv(url)
     except Exception as exc:  # noqa: BLE001
-        st.error(f"Could not open or create spreadsheet '{name}': {exc}")
-        st.stop()
+        st.error(f"Failed to read '{sheet_name}' tab: {exc}")
+        return pd.DataFrame()
 
 
-def ensure_worksheet_headers(spreadsheet, headers):
-    ws = spreadsheet.sheet1
+def write_sheet(sheet_name, row_data):
+    """Append a new row to a tab of the shared Google Sheet by POSTing to
+    the Apps Script Web App. `row_data` is a dict of column_name -> value;
+    the Apps Script side maps it onto the tab's header row."""
+    payload = {"action": "append", "sheetName": sheet_name, "rowData": row_data}
     try:
-        existing_headers = ws.row_values(1)
-    except Exception:  # noqa: BLE001
-        existing_headers = []
-    if existing_headers != headers:
-        # Only overwrite the header row if it is empty or incorrect; do not
-        # touch existing data rows. This also transparently upgrades older
-        # sheets (e.g. pre-Document-Checklist-Grid or pre-Notice-Generator)
-        # by appending new trailing columns without disturbing existing data.
-        if not existing_headers:
-            ws.append_row(headers)
-        else:
-            merged = list(existing_headers)
-            for h in headers:
-                if h not in merged:
-                    merged.append(h)
-            ws.update("A1", [merged])
-    return ws
+        response = requests.post(st.secrets["WRITE_API_URL"], json=payload, timeout=30)
+        response.raise_for_status()
+        return response.json()
+    except Exception as exc:  # noqa: BLE001
+        st.error(f"Failed to write a new row to '{sheet_name}': {exc}")
+        return None
 
 
-@st.cache_resource(show_spinner="Connecting to HYDRA databases...")
+def update_sheet_row(sheet_name, match_column, match_value, updates):
+    """Update the first existing row where `match_column` == `match_value`
+    in a tab of the shared Google Sheet by POSTing to the same Apps Script
+    Web App, preserving any columns not present in `updates`."""
+    payload = {
+        "action": "update",
+        "sheetName": sheet_name,
+        "matchColumn": match_column,
+        "matchValue": match_value,
+        "rowData": updates,
+    }
+    try:
+        response = requests.post(st.secrets["WRITE_API_URL"], json=payload, timeout=30)
+        response.raise_for_status()
+        return response.json()
+    except Exception as exc:  # noqa: BLE001
+        st.error(f"Failed to update '{sheet_name}' row where {match_column}={match_value}: {exc}")
+        return None
+
+
 def init_sheets():
-    client = get_gspread_client()
-
-    whitelist_sh = get_or_create_spreadsheet(client, WHITELIST_SHEET_NAME)
-    whitelist_ws = ensure_worksheet_headers(whitelist_sh, WHITELIST_HEADERS)
-
-    cases_sh = get_or_create_spreadsheet(client, CASES_SHEET_NAME)
-    cases_ws = ensure_worksheet_headers(cases_sh, CASES_HEADERS)
-
-    audit_sh = get_or_create_spreadsheet(client, AUDIT_SHEET_NAME)
-    audit_ws = ensure_worksheet_headers(audit_sh, AUDIT_HEADERS)
-
-    unassigned_sh = get_or_create_spreadsheet(client, UNASSIGNED_SHEET_NAME)
-    unassigned_ws = ensure_worksheet_headers(unassigned_sh, UNASSIGNED_HEADERS)
-
-    return whitelist_ws, cases_ws, audit_ws, unassigned_ws
+    """No credentials or setup API calls needed anymore. Just confirm the
+    two required secrets are configured, then hand back the four tab-name
+    strings used throughout the app (these used to be gspread Worksheet
+    objects; every downstream function now accepts either interchangeably
+    since it just forwards the value to read_sheet/write_sheet/update_sheet_row)."""
+    missing = [key for key in ("DATABASE_URL", "WRITE_API_URL") if key not in st.secrets]
+    if missing:
+        st.error(
+            "Missing " + ", ".join(f"`{m}`" for m in missing) + " in secrets.toml. "
+            "See the setup instructions at the top of app.py."
+        )
+        st.stop()
+    return WHITELIST_SHEET_NAME, CASES_SHEET_NAME, AUDIT_SHEET_NAME, UNASSIGNED_SHEET_NAME
 
 
 def load_whitelist(whitelist_ws):
     """Return dict keyed by lowercase gmail_id -> row dict."""
-    try:
-        records = whitelist_ws.get_all_records()
-    except Exception as exc:  # noqa: BLE001
-        st.error(f"Failed to read User_Whitelist: {exc}")
+    df = read_sheet(whitelist_ws)
+    if df.empty:
         return {}
+    df = df.fillna("")
     result = {}
-    for row in records:
-        gmail = str(row.get("gmail_id", "")).strip().lower()
+    for _, row in df.iterrows():
+        row_dict = row.to_dict()
+        gmail = str(row_dict.get("gmail_id", "")).strip().lower()
         if gmail:
-            result[gmail] = row
+            result[gmail] = row_dict
     return result
 
 
 def load_cases(cases_ws):
-    try:
-        return cases_ws.get_all_records()
-    except Exception as exc:  # noqa: BLE001
-        st.error(f"Failed to read HYDRA_Cases: {exc}")
+    df = read_sheet(cases_ws)
+    if df.empty:
         return []
+    for col in CASES_HEADERS:
+        if col not in df.columns:
+            df[col] = ""
+    df = df.fillna("")
+    return df.to_dict("records")
 
 
 def append_case_row(cases_ws, case_dict):
-    row = [case_dict.get(col, "") for col in CASES_HEADERS]
-    cases_ws.append_row(row, value_input_option="USER_ENTERED")
+    row_data = {col: case_dict.get(col, "") for col in CASES_HEADERS}
+    write_sheet(cases_ws, row_data)
 
 
 def append_audit_entry(audit_ws, case_id, user_name, user_role, department, action):
-    row = [
-        datetime.utcnow().isoformat(timespec="seconds") + "Z",
-        case_id,
-        user_name,
-        user_role,
-        department,
-        action,
-    ]
-    try:
-        audit_ws.append_row(row, value_input_option="USER_ENTERED")
-    except Exception as exc:  # noqa: BLE001
+    row_data = {
+        "timestamp": datetime.utcnow().isoformat(timespec="seconds") + "Z",
+        "case_id": case_id,
+        "user_name": user_name,
+        "user_role": user_role,
+        "department": department,
+        "action": action,
+    }
+    result = write_sheet(audit_ws, row_data)
+    if result is None:
         # Auditing must never crash the app; surface as a non-blocking warning.
-        st.warning(f"Could not write audit log entry: {exc}")
-
-
-def _find_row_number_by_value(ws, column_index, value):
-    """Return the 1-indexed sheet row number where column `column_index`
-    (1-indexed) equals `value`, or None."""
-    try:
-        col_values = ws.col_values(column_index)
-    except Exception as exc:  # noqa: BLE001
-        st.error(f"Failed to read sheet column {column_index}: {exc}")
-        return None
-    for idx, cell_value in enumerate(col_values, start=1):
-        if cell_value == value:
-            return idx
-    return None
-
-
-def get_case_row_number(cases_ws, case_id):
-    """Return the 1-indexed sheet row number for a given case_id, or None."""
-    return _find_row_number_by_value(cases_ws, 1, case_id)
+        st.warning("Could not write audit log entry.")
 
 
 def update_case_fields(cases_ws, case_id, updates):
     """
     Partially update a case row identified by case_id, preserving any
-    columns not present in `updates`. Raises ValueError if the case is
-    not found.
+    columns not present in `updates`. Raises ValueError if the update
+    request fails (e.g. the case isn't found by the Apps Script backend).
     """
-    row_num = get_case_row_number(cases_ws, case_id)
-    if row_num is None:
-        raise ValueError(f"Case '{case_id}' not found in {CASES_SHEET_NAME}.")
-
-    current_values = cases_ws.row_values(row_num)
-    while len(current_values) < len(CASES_HEADERS):
-        current_values.append("")
-
-    row_dict = dict(zip(CASES_HEADERS, current_values))
-    row_dict.update(updates)
-    new_row = [str(row_dict.get(col, "")) for col in CASES_HEADERS]
-
-    end_cell = gspread.utils.rowcol_to_a1(row_num, len(CASES_HEADERS))
-    match = re.match(r"([A-Z]+)(\d+)", end_cell)
-    end_col_letters = match.group(1) if match else "AJ"
-    cell_range = f"A{row_num}:{end_col_letters}{row_num}"
-
-    cases_ws.update(cell_range, [new_row], value_input_option="USER_ENTERED")
+    result = update_sheet_row(cases_ws, "case_id", case_id, updates)
+    if result is None:
+        raise ValueError(f"Case '{case_id}' could not be updated in {cases_ws}.")
 
 
 def load_unassigned_scans(unassigned_ws):
-    try:
-        return unassigned_ws.get_all_records()
-    except Exception as exc:  # noqa: BLE001
-        st.error(f"Failed to read {UNASSIGNED_SHEET_NAME}: {exc}")
+    df = read_sheet(unassigned_ws)
+    if df.empty:
         return []
+    for col in UNASSIGNED_HEADERS:
+        if col not in df.columns:
+            df[col] = ""
+    df = df.fillna("")
+    return df.to_dict("records")
 
 
 def append_unassigned_scan(unassigned_ws, scan_dict):
-    row = [scan_dict.get(col, "") for col in UNASSIGNED_HEADERS]
-    unassigned_ws.append_row(row, value_input_option="USER_ENTERED")
+    row_data = {col: scan_dict.get(col, "") for col in UNASSIGNED_HEADERS}
+    write_sheet(unassigned_ws, row_data)
 
 
 def update_unassigned_fields(unassigned_ws, scan_id, updates):
-    row_num = _find_row_number_by_value(unassigned_ws, 1, scan_id)
-    if row_num is None:
-        raise ValueError(f"Scan '{scan_id}' not found in {UNASSIGNED_SHEET_NAME}.")
-
-    current_values = unassigned_ws.row_values(row_num)
-    while len(current_values) < len(UNASSIGNED_HEADERS):
-        current_values.append("")
-
-    row_dict = dict(zip(UNASSIGNED_HEADERS, current_values))
-    row_dict.update(updates)
-    new_row = [str(row_dict.get(col, "")) for col in UNASSIGNED_HEADERS]
-
-    end_cell = gspread.utils.rowcol_to_a1(row_num, len(UNASSIGNED_HEADERS))
-    match = re.match(r"([A-Z]+)(\d+)", end_cell)
-    end_col_letters = match.group(1) if match else "I"
-    cell_range = f"A{row_num}:{end_col_letters}{row_num}"
-
-    unassigned_ws.update(cell_range, [new_row], value_input_option="USER_ENTERED")
+    result = update_sheet_row(unassigned_ws, "scan_id", scan_id, updates)
+    if result is None:
+        raise ValueError(f"Scan '{scan_id}' could not be updated in {unassigned_ws}.")
 
 
 # --------------------------------------------------------------------------------
