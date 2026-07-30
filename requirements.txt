@@ -1,0 +1,11 @@
+google-auth
+google-api-python-client
+google-generativeai
+gspread
+qrcode
+reportlab
+pypdf
+Pillow
+PyPDF2
+pandas
+requests
