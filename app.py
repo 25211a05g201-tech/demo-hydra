@@ -64,9 +64,11 @@ SETUP INSTRUCTIONS
 
    NOTE: `gspread` has been removed — the database layer below no longer
    talks to the Sheets API directly. `google-auth` / `google-api-python-client`
-   are still required, but now only for the Google Drive folder-scaffolding
+   are still required only if you want the Google Drive folder-scaffolding
    and file-upload features (create_case_folder_structure,
-   upload_bytes_to_drive_folder, etc.), which are unchanged from before.
+   upload_bytes_to_drive_folder, etc.) — see step 3 below. Those features
+   are now OPTIONAL: the app runs fine without them configured, it just
+   disables the Drive-dependent screens until you add credentials.
 
 2. CREDENTIAL-FREE DATABASE (Google Sheets, via CSV export + Apps Script) ---
 
@@ -136,11 +138,19 @@ SETUP INSTRUCTIONS
         DATABASE_URL = "https://docs.google.com/spreadsheets/d/<YOUR_SHEET_ID>"
         WRITE_API_URL = "https://script.google.com/macros/s/<YOUR_DEPLOYMENT_ID>/exec"
 
-3. GOOGLE DRIVE (unchanged) — folder scaffolding and document/notice-PDF
-   uploads still use a Google Cloud service account with the Drive API
-   enabled, since Drive has no simple credential-free write path. Create
-   the service account, enable the Drive API, share the target Drive
-   location with its email, and add its JSON key to secrets.toml:
+3. GOOGLE DRIVE (OPTIONAL — folder scaffolding and document/notice-PDF
+   uploads) still uses a Google Cloud service account with the Drive API
+   enabled, since Drive has no simple credential-free write path. This is
+   NOT required to run the app: without it, case creation, the analytics
+   board, and "My Cases" all work normally against the Sheet — only the
+   Bulk Upload Auto-Sorter, Pending Review Queue, and Notice approval/
+   sign-off (the screens that physically move files in Drive) show a
+   "Drive isn't connected yet" notice and disable themselves until you add
+   this block.
+
+   To enable it: create the service account, enable the Drive API, share
+   the target Drive location with its email, and add its JSON key to
+   secrets.toml:
 
      [gcp_service_account]
      type = "service_account"
@@ -407,24 +417,48 @@ GEMINI_MODEL_NAME = "gemini-1.5-flash"
 
 @st.cache_resource(show_spinner=False)
 def get_credentials():
-    """Load service account credentials from st.secrets."""
+    """Load service account credentials from st.secrets, if configured.
+
+    Returns None (never raises or calls st.stop()) when the
+    `[gcp_service_account]` block isn't present yet, or when it fails to
+    parse. Google Drive is an OPTIONAL feature — the app must keep running
+    without it, so every caller of this function has to handle a None
+    return gracefully rather than assuming credentials always exist."""
     if "gcp_service_account" not in st.secrets:
-        st.error(
-            "Missing `[gcp_service_account]` in secrets.toml. "
-            "See the setup instructions at the top of app.py."
-        )
-        st.stop()
-    creds_dict = dict(st.secrets["gcp_service_account"])
-    return Credentials.from_service_account_info(creds_dict, scopes=SCOPES)
+        return None
+    try:
+        creds_dict = dict(st.secrets["gcp_service_account"])
+        return Credentials.from_service_account_info(creds_dict, scopes=SCOPES)
+    except Exception:  # noqa: BLE001
+        return None
 
 
 @st.cache_resource(show_spinner=False)
 def get_drive_service():
+    """Build the Drive client, or return None if no service account is
+    configured (or it fails to build) — this is the single seam every
+    Drive-dependent feature checks before doing anything. Returning None
+    here must never crash the app; screens that need Drive show a
+    `drive_not_configured_notice()` and disable themselves instead."""
+    creds = get_credentials()
+    if creds is None:
+        return None
     try:
-        return build("drive", "v3", credentials=get_credentials(), cache_discovery=False)
-    except Exception as exc:  # noqa: BLE001
-        st.error(f"Failed to build Google Drive client: {exc}")
-        st.stop()
+        return build("drive", "v3", credentials=creds, cache_discovery=False)
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def drive_not_configured_notice():
+    """Shared message shown by any screen that needs Google Drive but
+    doesn't have a service account configured yet."""
+    st.warning(
+        "Google Drive isn't connected yet — add a `[gcp_service_account]` "
+        "block to `secrets.toml` to enable this. See the setup instructions "
+        "at the top of app.py (step 3). Everything else in the app (cases, "
+        "analytics, audit log) keeps working without it.",
+        icon="📁",
+    )
 
 
 @st.cache_resource(show_spinner=False)
@@ -1063,12 +1097,15 @@ def render_new_case_form(cases_ws, audit_ws, drive_service, model, user):
     complaint_file_bytes = complaint_file.getvalue() if complaint_file is not None else None
     complaint_filename = complaint_file.name if complaint_file is not None else None
 
-    with st.spinner(f"Creating case {case_id}, running AI complaint briefing, and setting up Drive folders..."):
-        try:
-            create_case_folder_structure(drive_service, case_id)
-        except Exception as exc:  # noqa: BLE001
-            st.sidebar.error(f"Case folder creation failed in Drive: {exc}")
-            return
+    with st.spinner(f"Creating case {case_id} and running AI complaint briefing..."):
+        # ---- Drive folder scaffolding is OPTIONAL: skip cleanly if Drive
+        # ---- isn't configured rather than blocking case creation. ----------
+        if drive_service is not None:
+            try:
+                create_case_folder_structure(drive_service, case_id)
+            except Exception as exc:  # noqa: BLE001
+                st.sidebar.error(f"Case folder creation failed in Drive: {exc}")
+                return
 
         # ---- Briefing 1: AI Complaint Brief -----------------------------------
         complaint_brief_text = generate_complaint_brief(
@@ -1078,8 +1115,10 @@ def render_new_case_form(cases_ws, audit_ws, drive_service, model, user):
             filename=complaint_filename,
         )
 
-        # File the raw complaint document itself for the record, if attached.
-        if complaint_file_bytes:
+        # File the raw complaint document itself for the record, if attached
+        # and Drive is available. If not, the AI brief above still captures
+        # what mattered, and the file simply isn't archived to Drive.
+        if complaint_file_bytes and drive_service is not None:
             try:
                 layouts_folder_id = get_case_layouts_folder_id(drive_service, case_id)
                 upload_bytes_to_drive_folder(
@@ -1111,7 +1150,7 @@ def render_new_case_form(cases_ws, audit_ws, drive_service, model, user):
         try:
             append_case_row(cases_ws, case_row)
         except Exception as exc:  # noqa: BLE001
-            st.sidebar.error(f"Case folder was created, but saving the case row failed: {exc}")
+            st.sidebar.error(f"Saving the case row failed: {exc}")
             return
 
         append_audit_entry(
@@ -1123,7 +1162,13 @@ def render_new_case_form(cases_ws, audit_ws, drive_service, model, user):
             action="Case created (AI complaint brief generated)",
         )
 
-    st.sidebar.success(f"Case {case_id} created successfully.")
+    if drive_service is None:
+        st.sidebar.success(
+            f"Case {case_id} created successfully. (Drive folder scaffolding "
+            "was skipped — connect Drive to enable it.)"
+        )
+    else:
+        st.sidebar.success(f"Case {case_id} created successfully.")
     st.cache_data.clear()
     st.rerun()
 
@@ -1192,7 +1237,11 @@ def process_single_upload(
     grid slot, or into Unassigned_Scans for manual triage. If the file is a
     matched Field Inspection Report, also triggers Briefing 2 (AI Field
     Findings Brief) and advances the case to 'Inspected'. Returns a short
-    status message string for display in the UI."""
+    status message string for display in the UI.
+
+    Requires a live `drive_service` — callers must not invoke this when
+    Drive isn't configured (see the guard at the top of
+    render_bulk_upload_auto_sorter)."""
 
     case_id = extract_case_id_from_filename(filename, known_case_ids)
     doc_key = detect_document_type_from_filename(filename)
@@ -1290,6 +1339,11 @@ def process_single_upload(
 
 def render_bulk_upload_auto_sorter(cases_ws, audit_ws, unassigned_ws, drive_service, model, user):
     st.subheader("📤 Bulk Upload Auto-Sorter")
+
+    if drive_service is None:
+        drive_not_configured_notice()
+        return
+
     st.caption(
         "Upload multiple files at once. Files whose name contains a Case ID "
         "and a recognizable document type (e.g. `HYDRA-20260731-AB12CD_layout_a.pdf` "
@@ -1342,6 +1396,11 @@ def render_bulk_upload_auto_sorter(cases_ws, audit_ws, unassigned_ws, drive_serv
 
 def render_pending_review_queue(cases_ws, audit_ws, unassigned_ws, drive_service, model, user):
     st.subheader("📥 Pending Review Queue")
+
+    if drive_service is None:
+        drive_not_configured_notice()
+        return
+
     st.caption(
         "Files that couldn't be auto-sorted land here. Assign each one to a "
         "Case ID and Document Type to route it into the right Drive folder "
@@ -1609,8 +1668,12 @@ def render_notice_generator(cases_ws, audit_ws, drive_service, model, user):
     st.caption(
         "Draft a formal HYDRA show-cause notice for cases that have completed field "
         "inspection. Only Head/Approver accounts can approve and sign off; drafting "
-        "does not require sign-off privileges."
+        "does not require sign-off privileges or Google Drive — only the final "
+        "approve-and-file step needs Drive to store the signed PDF."
     )
+
+    if drive_service is None:
+        drive_not_configured_notice()
 
     if not REPORTLAB_AVAILABLE or not QRCODE_AVAILABLE:
         st.warning(
@@ -1688,7 +1751,13 @@ def render_notice_generator(cases_ws, audit_ws, drive_service, model, user):
                 "for your role."
             )
 
-        approve_disabled = (not is_head) or (not recipient_name.strip()) or (not REPORTLAB_AVAILABLE) or (not QRCODE_AVAILABLE)
+        approve_disabled = (
+            (not is_head)
+            or (not recipient_name.strip())
+            or (not REPORTLAB_AVAILABLE)
+            or (not QRCODE_AVAILABLE)
+            or (drive_service is None)
+        )
 
         if st.button(
             "✅ Approve and Sign Off",
@@ -1699,6 +1768,9 @@ def render_notice_generator(cases_ws, audit_ws, drive_service, model, user):
             if user["role"] != "Head":
                 # Server-side role gate — never trust the disabled attribute alone.
                 st.error("Access denied: only Head/Approver roles may approve notices.")
+                return
+            if drive_service is None:
+                st.error("Google Drive isn't connected — approval is disabled until it is.")
                 return
 
             with st.spinner("Rendering signed notice PDF and filing to Drive..."):
@@ -2149,7 +2221,7 @@ def main():
         return
 
     user = st.session_state.user
-    drive_service = get_drive_service()
+    drive_service = get_drive_service()  # may be None — every caller below handles that
     model = get_gemini_model()
 
     # Log the login event once per session.
@@ -2171,6 +2243,10 @@ def main():
             st.caption("🤖 AI briefing/drafting: not configured (add `[gemini] api_key` to secrets.toml)")
         else:
             st.caption("🤖 AI briefing/drafting: enabled (Gemini 1.5 Flash)")
+        if drive_service is None:
+            st.caption("📁 Google Drive: not connected (add `[gcp_service_account]` to secrets.toml)")
+        else:
+            st.caption("📁 Google Drive: connected")
         if st.button("Log out", use_container_width=True):
             logout()
         st.divider()
