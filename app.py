@@ -725,35 +725,12 @@ def update_sheet_row(sheet_name, match_column, match_value, updates):
         return None
 
 
-def upload_bytes_via_apps_script(case_id, uploaded_file, sub_folder):
+def upload_bytes_via_apps_script(case_id, file_bytes, filename, mime_type, sub_folder):
     """
-    Bypasses Google Drive entirely. Reads the file in memory, 
-    calls Gemini to generate the summary, and returns the brief.
+    Bypasses Google Drive entirely. Returns a mock URL so the 
+    system continues executing and saves the case cleanly.
     """
-    try:
-        file_bytes = uploaded_file.read()
-        
-        # 1. Call Gemini directly on the file in memory
-        model = genai.GenerativeModel("gemini-1.5-flash")
-        response = model.generate_content([
-            "Write a concise 2-sentence summary of this field inspection report:",
-            {"mime_type": uploaded_file.type, "data": file_bytes}
-        ])
-        field_brief = response.text
-        
-        # 2. Return success with a mock URL and the real AI brief
-        return {
-            "status": "success",
-            "file_url": "Bypassed (Stored locally in memory)",
-            "brief": field_brief
-        }
-    except Exception as e:
-        # Fallback if Gemini fails
-        return {
-            "status": "success",
-            "file_url": "Bypassed (Stored locally in memory)",
-            "brief": f"AI brief failed: {str(e)}"
-        }
+    return "Bypassed (Stored locally in memory)"
 
 
 
