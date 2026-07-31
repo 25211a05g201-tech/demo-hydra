@@ -727,10 +727,37 @@ def update_sheet_row(sheet_name, match_column, match_value, updates):
 
 def upload_bytes_via_apps_script(case_id, file_bytes, filename, mime_type, sub_folder):
     """
-    Bypasses Google Drive entirely. Returns a mock URL so the 
-    system continues executing and saves the case cleanly.
+    Converts file bytes to Base64 and uploads the actual file to Google Drive 
+    using the Apps Script Web App. Returns the real Google Drive URL.
     """
-    return "Bypassed (Stored locally in memory)"
+    import base64
+    try:
+        # 1. Convert raw bytes to Base64 string for transmission
+        base64_str = base64.b64encode(file_bytes).decode("utf-8")
+        
+        # 2. Build the payload matching the Apps Script exact action keys
+        payload = {
+            "action": "uploadFile",
+            "caseId": case_id,
+            "fileName": filename,
+            "fileBytes": base64_str,
+            "mimeType": mime_type,
+            "subFolder": sub_folder
+        }
+        
+        # 3. POST to Google Apps Script
+        response = requests.post(st.secrets["WRITE_API_URL"], json=payload, timeout=45)
+        response.raise_for_status()
+        res_data = response.json()
+        
+        if res_data.get("status") == "success":
+            return res_data.get("file_url")
+        else:
+            st.error(f"Google Drive Upload Error: {res_data.get('message')}")
+            return None
+    except Exception as e:
+        st.error(f"Failed to connect to Google Drive: {e}")
+        return None
 
 
 
