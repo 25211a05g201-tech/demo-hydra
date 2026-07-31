@@ -770,6 +770,7 @@ def upload_bytes_via_apps_script(case_id, file_bytes, filename, mime_type, sub_f
     file_url = result.get("file_url") if isinstance(result, dict) else None
     if not file_url:
         st.error(f"File upload for '{filename}' did not return a file_url.")
+        st.error(f"Google Raw Response: {result}")
         return None
     return file_url
 
