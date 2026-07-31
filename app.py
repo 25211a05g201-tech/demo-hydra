@@ -88,8 +88,9 @@ SETUP INSTRUCTIONS
 
    a) Create one Google Sheet with four tabs, named EXACTLY:
         User_Whitelist, HYDRA_Cases, Audit_Logs, Unassigned_Scans
-      Give each tab a header row matching (in any order — the app reads
-      columns by name) the constants below in this file:
+      Give each tab a header row matching (in any order for reads — but see
+      the IMPORTANT note below about the write path) the constants below in
+      this file:
         User_Whitelist  -> WHITELIST_HEADERS
         HYDRA_Cases     -> CASES_HEADERS
         Audit_Logs      -> AUDIT_HEADERS
@@ -98,18 +99,32 @@ SETUP INSTRUCTIONS
         gmail_id             | role  | department | name
         head@example.com     | Head  | HYDRA HQ   | Jane Doe
 
+      IMPORTANT — column order now matters for writes: new rows are sent to
+      the Apps Script Web App as a flat, position-based array (see "b)"
+      below), built client-side by walking CASES_HEADERS / AUDIT_HEADERS /
+      UNASSIGNED_HEADERS in order. That means each tab's header row in the
+      actual Google Sheet MUST be in that exact same left-to-right order,
+      or values will land in the wrong columns. Reads (`read_sheet`, via
+      pandas) are unaffected by column order since they match by header
+      name.
+
    b) Share the Sheet as "Anyone with the link — Viewer" (required so
       pd.read_csv can fetch the gviz CSV export with no auth).
 
    c) In the same Sheet, open Extensions -> Apps Script and paste a Web
       App that accepts POST requests shaped like:
-        {"action": "append",  "sheetName": "<tab>", "rowData": {col: val, ...}}
+        {"action": "append",  "sheetName": "<tab>", "rowData": [val1, val2, ...]}
         {"action": "update",  "sheetName": "<tab>", "matchColumn": "<col>",
          "matchValue": "<val>", "rowData": {col: val, ...}}
-      "append" should add a new row (matching columns to the tab's header
-      row, in any order). "update" should find the first row where
-      matchColumn == matchValue and overwrite only the columns present in
-      rowData, leaving every other column untouched. A minimal example:
+      "append" now sends `rowData` as a flat, position-based ARRAY (already
+      ordered to match the tab's header row exactly by the Python code
+      below — see dict_to_ordered_row() / write_sheet()), so the Apps
+      Script side can append it directly with no header lookup needed.
+      "update" still sends `rowData` as an OBJECT (column_name -> value),
+      since updates are partial and only touch specific columns; the Apps
+      Script side finds the first row where matchColumn == matchValue and
+      overwrites only the columns present in rowData, leaving every other
+      column untouched. A minimal example:
 
         function doPost(e) {
           var body = JSON.parse(e.postData.contents);
@@ -118,8 +133,9 @@ SETUP INSTRUCTIONS
           var headers = sheet.getRange(1, 1, 1, sheet.getLastColumn()).getValues()[0];
 
           if (body.action === "append") {
-            var newRow = headers.map(function(h) { return body.rowData[h] !== undefined ? body.rowData[h] : ""; });
-            sheet.appendRow(newRow);
+            // rowData already arrives as a flat array, in the exact same
+            // left-to-right order as this tab's header row — append as-is.
+            sheet.appendRow(body.rowData);
           } else if (body.action === "update") {
             var data = sheet.getDataRange().getValues();
             var matchColIdx = headers.indexOf(body.matchColumn);
@@ -257,10 +273,17 @@ UNASSIGNED_SHEET_NAME = "Unassigned_Scans"
 
 WHITELIST_HEADERS = ["gmail_id", "role", "department", "name"]
 
-# NOTE: the original 17 columns below are untouched (anti-forget rule). The
+# NOTE: the original columns are untouched (anti-forget rule). The
 # document-checklist-grid feature adds link/uploader/department columns for
 # each of the five mandatory documents, and the AI Notice Generator feature
 # adds notice-related columns, all appended at the end of the header list.
+# The four "extended enforcement tracking" columns (joint_survey_status,
+# objection_status, stay_order_status, original_permitting_officer) are new
+# and are inserted right after the five document-status columns / before
+# land_saved_value, per the exact column order the underlying Google Sheet
+# tab now uses. Because writes are now position-based (see write_sheet()
+# below), THIS LIST'S ORDER MUST MATCH THE ACTUAL SHEET'S HEADER ROW
+# EXACTLY, left to right.
 CASES_HEADERS = [
     "case_id",
     "title",
@@ -275,6 +298,11 @@ CASES_HEADERS = [
     "layout_b1_revenue_status",
     "layout_b2_ghmc_status",
     "layout_b3_water_status",
+    # ---- Extended enforcement tracking columns (new) ----
+    "joint_survey_status",
+    "objection_status",
+    "stay_order_status",
+    "original_permitting_officer",
     "land_saved_value",
     "land_type",
     "resolution_brief",
@@ -333,6 +361,12 @@ CASE_TYPES = [
 ]
 
 LAND_TYPES = ["Government", "Private", "FTL (Full Tank Level)", "Buffer Zone", "Unclassified"]
+
+# Default status value used for the new extended enforcement tracking
+# columns (joint_survey_status, objection_status, stay_order_status) when a
+# case is first created — mirrors the "Pending" default already used for
+# the five document-checklist status columns.
+ENFORCEMENT_TRACKING_DEFAULT_STATUS = "Pending"
 
 # "Inspected" (set automatically once the AI Field Findings Brief is generated)
 # and "Notice Served" (set once the Head approves & signs off a notice) are new
@@ -512,10 +546,18 @@ def get_gemini_model():
 # Credential-free replacement for the old gspread/service-account layer:
 #   - READS go straight to the public CSV export of each tab in the shared
 #     Google Sheet (`read_sheet`) via pandas.
-#   - WRITES (both brand-new rows and in-place field updates) are POSTed as
-#     JSON to a single Google Apps Script Web App URL (`write_sheet` /
-#     `update_sheet_row`). See the SETUP INSTRUCTIONS docstring above for the
-#     exact Apps Script contract this expects.
+#   - WRITES come in two shapes now:
+#       * Brand-new rows (`write_sheet`) are sent as a flat, position-based
+#         ARRAY, pre-ordered client-side (via dict_to_ordered_row()) to
+#         match the target tab's header row exactly — e.g. CASES_HEADERS
+#         for HYDRA_Cases, AUDIT_HEADERS for Audit_Logs, UNASSIGNED_HEADERS
+#         for Unassigned_Scans. This matches Google Sheets' appendRow(),
+#         which itself expects a flat array of values, not a keyed object.
+#       * In-place field updates (`update_sheet_row`) are still sent as a
+#         partial OBJECT (column_name -> value), since only some columns
+#         change and every other existing column must be left untouched;
+#         that only works if the Apps Script side can look updates up by
+#         column NAME, which requires a dict, not a position-based array.
 #
 # Every other function in this file (load_whitelist, load_cases,
 # append_case_row, update_case_fields, append_audit_entry,
@@ -538,11 +580,36 @@ def read_sheet(sheet_name):
         return pd.DataFrame()
 
 
-def write_sheet(sheet_name, row_data):
+def dict_to_ordered_row(row_dict, headers):
+    """Convert a dict of column_name -> value into a flat list of values,
+    ordered to exactly match `headers` (e.g. CASES_HEADERS, AUDIT_HEADERS,
+    or UNASSIGNED_HEADERS). Missing keys become "" so the row always has
+    the correct number of positional columns for Google Sheets'
+    appendRow(). Values are stringified defensively (None -> ""), since the
+    JSON payload is going straight into a spreadsheet cell.
+    """
+    row = []
+    for col in headers:
+        value = row_dict.get(col, "")
+        row.append("" if value is None else value)
+    return row
+
+
+def write_sheet(sheet_name, row_values):
     """Append a new row to a tab of the shared Google Sheet by POSTing to
-    the Apps Script Web App. `row_data` is a dict of column_name -> value;
-    the Apps Script side maps it onto the tab's header row."""
-    payload = {"action": "append", "sheetName": sheet_name, "rowData": row_data}
+    the Apps Script Web App.
+
+    `row_values` MUST be a flat, position-based list of values, already
+    ordered to match the target tab's header row exactly (build it with
+    dict_to_ordered_row(row_dict, CASES_HEADERS) / AUDIT_HEADERS /
+    UNASSIGNED_HEADERS before calling this). Google Sheets' underlying
+    appendRow() call takes a flat array, not a keyed object, so the
+    ordering is done here on the Python side rather than relying on the
+    Apps Script side to map column names — see the module docstring's
+    SETUP INSTRUCTIONS (step 2c) for the matching Apps Script `doPost`
+    handler.
+    """
+    payload = {"action": "append", "sheetName": sheet_name, "rowData": row_values}
     try:
         response = requests.post(st.secrets["WRITE_API_URL"], json=payload, timeout=30)
         response.raise_for_status()
@@ -555,7 +622,15 @@ def write_sheet(sheet_name, row_data):
 def update_sheet_row(sheet_name, match_column, match_value, updates):
     """Update the first existing row where `match_column` == `match_value`
     in a tab of the shared Google Sheet by POSTing to the same Apps Script
-    Web App, preserving any columns not present in `updates`."""
+    Web App, preserving any columns not present in `updates`.
+
+    Unlike write_sheet() (new rows), `updates` here stays a dict/object of
+    column_name -> value, deliberately NOT converted to a positional array:
+    updates are partial by nature (only a handful of columns change at a
+    time), so the Apps Script side needs the column NAME to know which
+    single cell to overwrite, and every other existing column must be left
+    exactly as-is.
+    """
     payload = {
         "action": "update",
         "sheetName": sheet_name,
@@ -615,12 +690,12 @@ def load_cases(cases_ws):
 
 
 def append_case_row(cases_ws, case_dict):
-    row_data = {col: case_dict.get(col, "") for col in CASES_HEADERS}
-    write_sheet(cases_ws, row_data)
+    row_values = dict_to_ordered_row(case_dict, CASES_HEADERS)
+    write_sheet(cases_ws, row_values)
 
 
 def append_audit_entry(audit_ws, case_id, user_name, user_role, department, action):
-    row_data = {
+    row_dict = {
         "timestamp": datetime.utcnow().isoformat(timespec="seconds") + "Z",
         "case_id": case_id,
         "user_name": user_name,
@@ -628,7 +703,8 @@ def append_audit_entry(audit_ws, case_id, user_name, user_role, department, acti
         "department": department,
         "action": action,
     }
-    result = write_sheet(audit_ws, row_data)
+    row_values = dict_to_ordered_row(row_dict, AUDIT_HEADERS)
+    result = write_sheet(audit_ws, row_values)
     if result is None:
         # Auditing must never crash the app; surface as a non-blocking warning.
         st.warning("Could not write audit log entry.")
@@ -657,8 +733,8 @@ def load_unassigned_scans(unassigned_ws):
 
 
 def append_unassigned_scan(unassigned_ws, scan_dict):
-    row_data = {col: scan_dict.get(col, "") for col in UNASSIGNED_HEADERS}
-    write_sheet(unassigned_ws, row_data)
+    row_values = dict_to_ordered_row(scan_dict, UNASSIGNED_HEADERS)
+    write_sheet(unassigned_ws, row_values)
 
 
 def update_unassigned_fields(unassigned_ws, scan_id, updates):
@@ -1217,6 +1293,11 @@ def render_new_case_form(cases_ws, audit_ws, drive_service, model, user):
             "layout_b1_revenue_status": "Pending",
             "layout_b2_ghmc_status": "Pending",
             "layout_b3_water_status": "Pending",
+            # ---- Extended enforcement tracking columns (new) ----
+            "joint_survey_status": ENFORCEMENT_TRACKING_DEFAULT_STATUS,
+            "objection_status": ENFORCEMENT_TRACKING_DEFAULT_STATUS,
+            "stay_order_status": ENFORCEMENT_TRACKING_DEFAULT_STATUS,
+            "original_permitting_officer": "",
             "land_saved_value": "",
             "land_type": land_type,
             "resolution_brief": "",
@@ -1228,7 +1309,10 @@ def render_new_case_form(cases_ws, audit_ws, drive_service, model, user):
         # time we get here, complaint_brief_text is always a valid string
         # (either Gemini's output or the manual/default fallback above), so
         # a missing/broken Gemini key can never prevent the case from being
-        # saved.
+        # saved. append_case_row() itself now converts this dict into a flat,
+        # position-based list (via dict_to_ordered_row(case_row,
+        # CASES_HEADERS)) before it's POSTed, matching Google Sheets'
+        # appendRow() contract.
         try:
             append_case_row(cases_ws, case_row)
         except Exception as exc:  # noqa: BLE001
