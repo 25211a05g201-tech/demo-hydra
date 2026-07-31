@@ -5,20 +5,26 @@ Single-file Streamlit application implementing:
   1. Whitelist-based authentication (Google OAuth placeholder + working demo login)
   2. Google Sheets-backed database (User_Whitelist, HYDRA_Cases, Audit_Logs,
      Unassigned_Scans)
-  3. Automatic Google Drive folder scaffolding per case
+  3. Automatic Google Drive folder scaffolding per case (legacy service-account
+     path, still used for Pending Review file moves) PLUS a credential-free
+     Apps Script "uploadFile" path used for all direct file uploads (Bulk
+     Upload, New Case complaint document, and Approved Notice PDFs)
   4. Audit logging on login, case creation, document upload, AI briefings,
      notice sign-off, and case closure
   5. Head (Super-Admin) Performance & Impact Analytics Board with KPI metrics,
      breakdown charts, an interactive filterable case grid, officer assignment,
      and validated case closure with audit logging.
   6. Document Checklist Grid (Status Matrix) — a 5-row per-case matrix of the
-     mandatory HYDRA documents, each showing Uploaded/Missing, a clickable
-     Drive preview link, and the uploader's name + department.
+     mandatory HYDRA documents. Each document's status column now stores
+     EITHER "Pending" OR the actual Google Drive file URL returned by the
+     Apps Script uploader. The grid renders a green "✅ View File" link
+     straight to that URL whenever the status value starts with "http".
   7. Bulk Upload Auto-Sorter — operators can drag-and-drop many files at once;
      the backend parses filenames to detect the Case ID and document type,
-     uploads matched files straight into the right case folder, and routes
-     anything unmatched/unreadable/blurry into an "Unassigned_Scans" Drive
-     folder for manual triage.
+     uploads matched files straight into the right case folder via the Apps
+     Script "uploadFile" action, and routes anything unmatched/unreadable/
+     blurry into an "Unassigned_Scans" Drive folder (legacy service-account
+     path) for manual triage.
   8. Pending Review Queue — an exception-handling tab (Operator + Head) that
      lists everything sitting in "Unassigned_Scans" and lets a user manually
      map a scan to a Case ID + Document Type, which moves the file in Drive
@@ -29,7 +35,9 @@ Single-file Streamlit application implementing:
        summary into "complaint_brief".
        Briefing 2: when a "Field Inspection Report" document is filed
        (via Bulk Upload or Pending Review), Gemini reads it — including
-       handwritten scans — and writes a "Field Findings Brief" into
+       handwritten scans — directly from the in-memory bytes that were
+       just uploaded (no re-download round trip needed for the Bulk
+       Upload path) and writes a "Field Findings Brief" into
        "field_report_brief", then advances the case status to "Inspected".
      Both briefings — and the AI Notice Generator below — are fully
      crash-proofed: if Gemini is not configured, has a bad/missing API
@@ -40,10 +48,10 @@ Single-file Streamlit application implementing:
  10. AI Notice Generator with QR Code — for any "Inspected" case, the Head
      can have Gemini draft a formal HYDRA show-cause notice, edit it, and
      (Head-only) approve & sign off. Approval renders a PDF with an
-     embedded case-tracking QR code, files it to the case's
-     "Approved_Notices/" Drive folder, and advances status to
-     "Notice Served". Drafting itself is crash-proofed the same way as the
-     two briefings above.
+     embedded case-tracking QR code and files it via the Apps Script
+     "uploadFile" action into the case's "Approved_Notices/" Drive folder,
+     then advances status to "Notice Served". Drafting itself is
+     crash-proofed the same way as the two briefings above.
  11. Standalone local utility (no Streamlit/Sheets/Drive dependency) that
      splits one giant combined scanned PDF into separate documents by
      detecting blank/near-blank separator pages.
@@ -71,20 +79,23 @@ SETUP INSTRUCTIONS
 
    NOTE: `gspread` has been removed — the database layer below no longer
    talks to the Sheets API directly. `google-auth` / `google-api-python-client`
-   are still required only if you want the Google Drive folder-scaffolding
-   and file-upload features (create_case_folder_structure,
-   upload_bytes_to_drive_folder, etc.) — see step 3 below. Those features
-   are now OPTIONAL: the app runs fine without them configured, it just
-   disables the Drive-dependent screens until you add credentials.
+   are still required only if you want the LEGACY Google Drive service-account
+   path (folder scaffolding for Pending Review moves, etc — see step 3
+   below). Direct file uploads (Bulk Upload, New Case complaint doc, and
+   Approved Notice PDFs) now go through the credential-free Apps Script
+   "uploadFile" action instead and do NOT require the service account.
 
-2. CREDENTIAL-FREE DATABASE (Google Sheets, via CSV export + Apps Script) ---
+2. CREDENTIAL-FREE DATABASE + FILE UPLOADS (Google Sheets + Drive, via CSV
+   export + a single Apps Script Web App) ---
 
    Instead of a service account + gspread, the "database" (User_Whitelist,
-   HYDRA_Cases, Audit_Logs, Unassigned_Scans) is now a single Google Sheet
-   with four tabs, read via the public CSV export endpoint and written to
-   via a small Google Apps Script Web App you deploy from that same Sheet.
-   No Google Cloud Console project or service account is needed for this
-   part.
+   HYDRA_Cases, Audit_Logs, Unassigned_Scans) is a single Google Sheet with
+   four tabs, read via the public CSV export endpoint and written to via a
+   small Google Apps Script Web App you deploy from that same Sheet. That
+   same Web App also now accepts an "uploadFile" action that writes a
+   base64-encoded file straight into a per-case Drive subfolder and hands
+   back a shareable "file_url". No Google Cloud Console project or service
+   account is needed for either of these.
 
    a) Create one Google Sheet with four tabs, named EXACTLY:
         User_Whitelist, HYDRA_Cases, Audit_Logs, Unassigned_Scans
@@ -108,31 +119,63 @@ SETUP INSTRUCTIONS
       pandas) are unaffected by column order since they match by header
       name.
 
+      ALSO IMPORTANT — the document-status columns (layout_a_status,
+      field_report_status, layout_b1_revenue_status, layout_b2_ghmc_status,
+      layout_b3_water_status) now store either the literal string "Pending"
+      OR the full https:// Drive file URL returned by "uploadFile" — NOT
+      the word "Uploaded". The checklist grid (see
+      render_document_checklist_grid()) treats any value starting with
+      "http" as "this document is uploaded, and here's the link".
+
    b) Share the Sheet as "Anyone with the link — Viewer" (required so
       pd.read_csv can fetch the gviz CSV export with no auth).
 
    c) In the same Sheet, open Extensions -> Apps Script and paste a Web
       App that accepts POST requests shaped like:
-        {"action": "append",  "sheetName": "<tab>", "rowData": [val1, val2, ...]}
-        {"action": "update",  "sheetName": "<tab>", "matchColumn": "<col>",
+        {"action": "writeRow", "sheetName": "<tab>", "rowData": [val1, val2, ...]}
+        {"action": "update",   "sheetName": "<tab>", "matchColumn": "<col>",
          "matchValue": "<val>", "rowData": {col: val, ...}}
-      "append" now sends `rowData` as a flat, position-based ARRAY (already
-      ordered to match the tab's header row exactly by the Python code
-      below — see dict_to_ordered_row() / write_sheet()), so the Apps
+        {"action": "uploadFile", "caseId": "<case id>", "fileName": "<name>",
+         "fileBytes": "<base64 string>", "mimeType": "<mime>",
+         "subFolder": "Layouts_and_Field_Reports" | "Approved_Notices"}
+      "writeRow" sends `rowData` as a flat, position-based ARRAY (already
+      ordered to match the target tab's header row exactly by the Python
+      code below — see dict_to_ordered_row() / write_sheet()), so the Apps
       Script side can append it directly with no header lookup needed.
       "update" still sends `rowData` as an OBJECT (column_name -> value),
       since updates are partial and only touch specific columns; the Apps
       Script side finds the first row where matchColumn == matchValue and
       overwrites only the columns present in rowData, leaving every other
-      column untouched. A minimal example:
+      column untouched. "uploadFile" decodes the base64 `fileBytes`,
+      creates (or reuses) the case's Drive subfolder, writes the file
+      there, makes it link-shareable, and returns
+      {"ok": true, "file_url": "https://drive.google.com/..."}.
+
+      A minimal example (extend your existing doPost with the uploadFile
+      branch):
 
         function doPost(e) {
           var body = JSON.parse(e.postData.contents);
           var ss = SpreadsheetApp.getActiveSpreadsheet();
+
+          if (body.action === "uploadFile") {
+            var rootFolder = getOrCreateFolder_(DriveApp.getRootFolder(), "HYDRA_Cases");
+            var caseFolder = getOrCreateFolder_(rootFolder, body.caseId);
+            var subFolder = getOrCreateFolder_(caseFolder, body.subFolder);
+            var blob = Utilities.newBlob(
+              Utilities.base64Decode(body.fileBytes), body.mimeType, body.fileName
+            );
+            var file = subFolder.createFile(blob);
+            file.setSharing(DriveApp.Access.ANYONE_WITH_LINK, DriveApp.Permission.VIEW);
+            return ContentService.createTextOutput(
+              JSON.stringify({ ok: true, file_url: file.getUrl() })
+            ).setMimeType(ContentService.MimeType.JSON);
+          }
+
           var sheet = ss.getSheetByName(body.sheetName);
           var headers = sheet.getRange(1, 1, 1, sheet.getLastColumn()).getValues()[0];
 
-          if (body.action === "append") {
+          if (body.action === "writeRow") {
             // rowData already arrives as a flat array, in the exact same
             // left-to-right order as this tab's header row — append as-is.
             sheet.appendRow(body.rowData);
@@ -153,6 +196,12 @@ SETUP INSTRUCTIONS
             .setMimeType(ContentService.MimeType.JSON);
         }
 
+        function getOrCreateFolder_(parent, name) {
+          var it = parent.getFoldersByName(name);
+          if (it.hasNext()) return it.next();
+          return parent.createFolder(name);
+        }
+
       Deploy it (Deploy -> New deployment -> Web app), execute as yourself,
       access "Anyone", and copy the resulting Web App URL.
 
@@ -161,15 +210,21 @@ SETUP INSTRUCTIONS
         DATABASE_URL = "https://docs.google.com/spreadsheets/d/<YOUR_SHEET_ID>"
         WRITE_API_URL = "https://script.google.com/macros/s/<YOUR_DEPLOYMENT_ID>/exec"
 
-3. GOOGLE DRIVE (OPTIONAL — folder scaffolding and document/notice-PDF
-   uploads) still uses a Google Cloud service account with the Drive API
-   enabled, since Drive has no simple credential-free write path. This is
-   NOT required to run the app: without it, case creation, the analytics
-   board, and "My Cases" all work normally against the Sheet — only the
-   Bulk Upload Auto-Sorter, Pending Review Queue, and Notice approval/
-   sign-off (the screens that physically move files in Drive) show a
-   "Drive isn't connected yet" notice and disable themselves until you add
-   this block.
+3. GOOGLE DRIVE SERVICE ACCOUNT (OPTIONAL / LEGACY — only needed for the
+   Pending Review Queue's "move file between folders" step, and for
+   creating the case folder scaffold up front) still uses a Google Cloud
+   service account with the Drive API enabled, since that specific
+   move-a-file-between-folders operation isn't exposed by the Apps Script
+   uploadFile action. This is NOT required to run the app, and is no
+   longer required for the Bulk Upload Auto-Sorter's matched-file path,
+   the New Case complaint document, or Approved Notice PDFs — all of those
+   now go through the credential-free Apps Script "uploadFile" action
+   described in step 2 above. Without this service account configured,
+   case creation, the analytics board, "My Cases", Bulk Upload of matched
+   documents, and Notice approval all work normally — only the Pending
+   Review Queue (which still needs to *move* an already-uploaded
+   Unassigned_Scans file between Drive folders) shows a "Drive isn't
+   connected yet" notice and disables itself until you add this block.
 
    To enable it: create the service account, enable the Drive API, share
    the target Drive location with its email, and add its JSON key to
@@ -207,6 +262,7 @@ SETUP INSTRUCTIONS
 --------------------------------------------------------------------------------
 """
 
+import base64
 import io
 import os
 import re
@@ -284,6 +340,13 @@ WHITELIST_HEADERS = ["gmail_id", "role", "department", "name"]
 # tab now uses. Because writes are now position-based (see write_sheet()
 # below), THIS LIST'S ORDER MUST MATCH THE ACTUAL SHEET'S HEADER ROW
 # EXACTLY, left to right.
+#
+# NOTE ON *_status COLUMNS: layout_a_status / field_report_status /
+# layout_b1_revenue_status / layout_b2_ghmc_status / layout_b3_water_status
+# now hold either "Pending" (default) or the full https:// Drive file URL
+# returned by the Apps Script "uploadFile" action — see
+# render_document_checklist_grid() below, which renders a green
+# "✅ View File" link whenever the value starts with "http".
 CASES_HEADERS = [
     "case_id",
     "title",
@@ -308,6 +371,9 @@ CASES_HEADERS = [
     "resolution_brief",
     "created_at",
     # ---- Document Checklist Grid metadata (existing addition) ----
+    # link_col is now redundant with *_status holding the URL directly, but
+    # is kept (and still populated) for backwards-compatible schemas/tools
+    # that read it directly.
     "layout_a_link",
     "layout_a_uploader",
     "layout_a_department",
@@ -350,6 +416,10 @@ VALID_ROLES = {"Operator", "Head"}
 DRIVE_ROOT_FOLDER = "HYDRA_Cases"
 DRIVE_SUBFOLDERS = ["Layouts_and_Field_Reports", "Approved_Notices"]
 UNASSIGNED_DRIVE_FOLDER = "Unassigned_Scans"
+
+# Sub-folder names accepted by the Apps Script "uploadFile" action.
+UPLOAD_SUBFOLDER_LAYOUTS = "Layouts_and_Field_Reports"
+UPLOAD_SUBFOLDER_NOTICES = "Approved_Notices"
 
 CASE_TYPES = [
     "Encroachment",
@@ -478,9 +548,10 @@ def get_credentials():
 
     Returns None (never raises or calls st.stop()) when the
     `[gcp_service_account]` block isn't present yet, or when it fails to
-    parse. Google Drive is an OPTIONAL feature — the app must keep running
-    without it, so every caller of this function has to handle a None
-    return gracefully rather than assuming credentials always exist."""
+    parse. Google Drive (legacy service-account path) is an OPTIONAL
+    feature — the app must keep running without it, so every caller of
+    this function has to handle a None return gracefully rather than
+    assuming credentials always exist."""
     if "gcp_service_account" not in st.secrets:
         return None
     try:
@@ -494,8 +565,9 @@ def get_credentials():
 def get_drive_service():
     """Build the Drive client, or return None if no service account is
     configured (or it fails to build) — this is the single seam every
-    Drive-dependent feature checks before doing anything. Returning None
-    here must never crash the app; screens that need Drive show a
+    legacy Drive-dependent feature (currently: the Pending Review Queue's
+    file-move step) checks before doing anything. Returning None here must
+    never crash the app; screens that need it show a
     `drive_not_configured_notice()` and disable themselves instead."""
     creds = get_credentials()
     if creds is None:
@@ -507,13 +579,14 @@ def get_drive_service():
 
 
 def drive_not_configured_notice():
-    """Shared message shown by any screen that needs Google Drive but
-    doesn't have a service account configured yet."""
+    """Shared message shown by any screen that needs the legacy Google
+    Drive service-account path but doesn't have one configured yet."""
     st.warning(
-        "Google Drive isn't connected yet — add a `[gcp_service_account]` "
-        "block to `secrets.toml` to enable this. See the setup instructions "
-        "at the top of app.py (step 3). Everything else in the app (cases, "
-        "analytics, audit log) keeps working without it.",
+        "Google Drive (service account) isn't connected yet — add a "
+        "`[gcp_service_account]` block to `secrets.toml` to enable this. "
+        "See the setup instructions at the top of app.py (step 3). File "
+        "uploads elsewhere in the app (Bulk Upload, New Case, Notices) use "
+        "the Apps Script uploader instead and don't need this.",
         icon="📁",
     )
 
@@ -547,17 +620,22 @@ def get_gemini_model():
 #   - READS go straight to the public CSV export of each tab in the shared
 #     Google Sheet (`read_sheet`) via pandas.
 #   - WRITES come in two shapes now:
-#       * Brand-new rows (`write_sheet`) are sent as a flat, position-based
-#         ARRAY, pre-ordered client-side (via dict_to_ordered_row()) to
-#         match the target tab's header row exactly — e.g. CASES_HEADERS
-#         for HYDRA_Cases, AUDIT_HEADERS for Audit_Logs, UNASSIGNED_HEADERS
-#         for Unassigned_Scans. This matches Google Sheets' appendRow(),
-#         which itself expects a flat array of values, not a keyed object.
+#       * Brand-new rows (`write_sheet`) are sent with action "writeRow" as
+#         a flat, position-based ARRAY, pre-ordered client-side (via
+#         dict_to_ordered_row()) to match the target tab's header row
+#         exactly — e.g. CASES_HEADERS for HYDRA_Cases, AUDIT_HEADERS for
+#         Audit_Logs, UNASSIGNED_HEADERS for Unassigned_Scans. This matches
+#         Google Sheets' appendRow(), which itself expects a flat array of
+#         values, not a keyed object.
 #       * In-place field updates (`update_sheet_row`) are still sent as a
-#         partial OBJECT (column_name -> value), since only some columns
-#         change and every other existing column must be left untouched;
-#         that only works if the Apps Script side can look updates up by
-#         column NAME, which requires a dict, not a position-based array.
+#         partial OBJECT (column_name -> value) with action "update", since
+#         only some columns change and every other existing column must be
+#         left untouched; that only works if the Apps Script side can look
+#         updates up by column NAME, which requires a dict, not a
+#         position-based array.
+#   - FILE UPLOADS (`upload_bytes_via_apps_script` /
+#     `upload_file_via_apps_script`) POST a base64-encoded file with action
+#     "uploadFile" and get back {"ok": true, "file_url": "..."}.
 #
 # Every other function in this file (load_whitelist, load_cases,
 # append_case_row, update_case_fields, append_audit_entry,
@@ -597,7 +675,7 @@ def dict_to_ordered_row(row_dict, headers):
 
 def write_sheet(sheet_name, row_values):
     """Append a new row to a tab of the shared Google Sheet by POSTing to
-    the Apps Script Web App.
+    the Apps Script Web App with action "writeRow".
 
     `row_values` MUST be a flat, position-based list of values, already
     ordered to match the target tab's header row exactly (build it with
@@ -609,7 +687,7 @@ def write_sheet(sheet_name, row_values):
     SETUP INSTRUCTIONS (step 2c) for the matching Apps Script `doPost`
     handler.
     """
-    payload = {"action": "append", "sheetName": sheet_name, "rowData": row_values}
+    payload = {"action": "writeRow", "sheetName": sheet_name, "rowData": row_values}
     try:
         response = requests.post(st.secrets["WRITE_API_URL"], json=payload, timeout=30)
         response.raise_for_status()
@@ -624,12 +702,12 @@ def update_sheet_row(sheet_name, match_column, match_value, updates):
     in a tab of the shared Google Sheet by POSTing to the same Apps Script
     Web App, preserving any columns not present in `updates`.
 
-    Unlike write_sheet() (new rows), `updates` here stays a dict/object of
-    column_name -> value, deliberately NOT converted to a positional array:
-    updates are partial by nature (only a handful of columns change at a
-    time), so the Apps Script side needs the column NAME to know which
-    single cell to overwrite, and every other existing column must be left
-    exactly as-is.
+    Unlike write_sheet() (new rows, action "writeRow"), `updates` here
+    stays a dict/object of column_name -> value, deliberately NOT
+    converted to a positional array: updates are partial by nature (only a
+    handful of columns change at a time), so the Apps Script side needs
+    the column NAME to know which single cell to overwrite, and every
+    other existing column must be left exactly as-is.
     """
     payload = {
         "action": "update",
@@ -645,6 +723,81 @@ def update_sheet_row(sheet_name, match_column, match_value, updates):
     except Exception as exc:  # noqa: BLE001
         st.error(f"Failed to update '{sheet_name}' row where {match_column}={match_value}: {exc}")
         return None
+
+
+def upload_bytes_via_apps_script(case_id, file_bytes, filename, mime_type, sub_folder):
+    """Upload raw file bytes to Google Drive via the Apps Script Web App's
+    "uploadFile" action — the credential-free replacement for the old
+    Drive-API-service-account upload path. Base64-encodes `file_bytes` and
+    POSTs:
+
+        {
+            "action": "uploadFile",
+            "caseId": case_id,
+            "fileName": filename,
+            "fileBytes": base64_str,
+            "mimeType": mime_type,
+            "subFolder": sub_folder,   # "Layouts_and_Field_Reports" or "Approved_Notices"
+        }
+
+    Returns the "file_url" string from the response on success, or None on
+    failure (in which case an st.error() has already been shown, and
+    callers should treat the upload as not having happened rather than
+    writing a fake/placeholder link into the Sheet).
+    """
+    try:
+        base64_str = base64.b64encode(file_bytes).decode("utf-8")
+    except Exception as exc:  # noqa: BLE001
+        st.error(f"Could not base64-encode '{filename}' for upload: {exc}")
+        return None
+
+    payload = {
+        "action": "uploadFile",
+        "caseId": case_id,
+        "fileName": filename,
+        "fileBytes": base64_str,
+        "mimeType": mime_type,
+        "subFolder": sub_folder,
+    }
+    try:
+        response = requests.post(st.secrets["WRITE_API_URL"], json=payload, timeout=60)
+        response.raise_for_status()
+        result = response.json()
+    except Exception as exc:  # noqa: BLE001
+        st.error(f"File upload failed for '{filename}': {exc}")
+        return None
+
+    file_url = result.get("file_url") if isinstance(result, dict) else None
+    if not file_url:
+        st.error(f"File upload for '{filename}' did not return a file_url.")
+        return None
+    return file_url
+
+
+def upload_file_via_apps_script(case_id, uploaded_file, sub_folder):
+    """Convenience wrapper around upload_bytes_via_apps_script() for a
+    Streamlit `UploadedFile` object (e.g. from st.file_uploader()).
+
+    Reads the file as bytes with `uploaded_file.read()`, base64-encodes it,
+    and POSTs it to the Apps Script "uploadFile" action. Returns a tuple
+    (file_url, file_bytes) so callers that also need the raw bytes for
+    something else (e.g. running the AI Field Findings Brief in-memory on
+    the same upload, with no re-download round trip) don't have to re-read
+    the file object a second time.
+
+    Returns (None, None) if the file couldn't be read or the upload failed
+    (an st.error() is shown either way).
+    """
+    try:
+        file_bytes = uploaded_file.read()
+    except Exception as exc:  # noqa: BLE001
+        st.error(f"Could not read '{getattr(uploaded_file, 'name', 'file')}': {exc}")
+        return None, None
+
+    file_url = upload_bytes_via_apps_script(
+        case_id, file_bytes, uploaded_file.name, uploaded_file.type, sub_folder
+    )
+    return file_url, file_bytes
 
 
 def init_sheets():
@@ -744,8 +897,16 @@ def update_unassigned_fields(unassigned_ws, scan_id, updates):
 
 
 # --------------------------------------------------------------------------------
-# GOOGLE DRIVE FOLDER HELPERS
+# GOOGLE DRIVE FOLDER HELPERS (LEGACY SERVICE-ACCOUNT PATH)
 # --------------------------------------------------------------------------------
+# Everything in this section is now only used by the Pending Review Queue's
+# "move an Unassigned_Scans file into the right case folder" step, and by
+# the Unassigned_Scans upload path itself (which still needs a Drive
+# location to dump unmatched/unreadable files into, since the Apps Script
+# "uploadFile" action is case-scoped). Direct, case-scoped uploads
+# elsewhere in the app (Bulk Upload matches, New Case complaint doc,
+# Approved Notice PDFs) go through upload_bytes_via_apps_script() /
+# upload_file_via_apps_script() above instead and don't touch this section.
 
 def _escape_drive_query_value(value):
     return value.replace("'", "\\'")
@@ -797,15 +958,6 @@ def get_case_layouts_folder_id(drive_service, case_id):
     case_folder_id = get_or_create_drive_folder(drive_service, case_id, parent_id=root_id)
     return get_or_create_drive_folder(
         drive_service, "Layouts_and_Field_Reports", parent_id=case_folder_id
-    )
-
-
-def get_case_notices_folder_id(drive_service, case_id):
-    """Fetch (creating if necessary) the case's Approved_Notices folder id."""
-    root_id = get_or_create_drive_folder(drive_service, DRIVE_ROOT_FOLDER)
-    case_folder_id = get_or_create_drive_folder(drive_service, case_id, parent_id=root_id)
-    return get_or_create_drive_folder(
-        drive_service, "Approved_Notices", parent_id=case_folder_id
     )
 
 
@@ -987,6 +1139,10 @@ def is_file_readable_and_clean(filename, file_bytes):
 #     generation) can therefore always trust that these functions return
 #     *something* usable and keep going straight to writing to the Google
 #     Sheet — AI availability never blocks a save.
+#   - generate_field_report_brief() takes the raw in-memory bytes of the
+#     just-uploaded file directly (the same bytes handed to
+#     upload_bytes_via_apps_script() / upload_file_via_apps_script()), so
+#     there is no re-download round trip needed to run Briefing 2.
 
 def generate_complaint_brief(model, raw_text=None, file_bytes=None, filename=None):
     """Briefing 1: read the raw complaint text and/or an attached complaint
@@ -1037,7 +1193,10 @@ def generate_complaint_brief(model, raw_text=None, file_bytes=None, filename=Non
 
 def generate_field_report_brief(model, file_bytes, filename):
     """Briefing 2: read a Field Inspection Report file (typed or handwritten
-    scan, PDF or image) and return a concise 'Field Findings Brief'.
+    scan, PDF or image) directly from in-memory bytes — the same bytes that
+    were just base64-encoded and POSTed to the Apps Script "uploadFile"
+    action — and return a concise 'Field Findings Brief'. No re-download
+    from Drive is needed.
 
     Crash-proof fallback: if Gemini isn't configured, or the API call fails
     for any reason, show a mild warning and fall back to a manual/default
@@ -1085,7 +1244,11 @@ def apply_field_report_brief_to_case(model, cases_ws, audit_ws, case_id, file_by
     case has already progressed past that point (e.g. Closed / Notice
     Served). Never raises — failures are surfaced via st.warning() /
     generate_field_report_brief()'s own fallback instead of blocking the
-    upload flow, and the checklist/status update always still runs."""
+    upload flow, and the checklist/status update always still runs.
+
+    `file_bytes` is the same in-memory byte string that was (or is about
+    to be) base64-encoded and POSTed via upload_bytes_via_apps_script() —
+    Gemini reads it directly, with no re-download from Drive needed."""
     brief_text = generate_field_report_brief(model, file_bytes, filename)
 
     updates = {"field_report_brief": brief_text}
@@ -1239,18 +1402,27 @@ def render_new_case_form(cases_ws, audit_ws, drive_service, model, user):
         return
 
     case_id = generate_case_id()
-    complaint_file_bytes = complaint_file.getvalue() if complaint_file is not None else None
+    # Read the uploaded complaint file's bytes once, up front, so both the
+    # AI complaint briefing below and the Apps Script archival upload can
+    # use the same in-memory bytes without needing to re-read the (single-
+    # use) file stream a second time.
+    complaint_file_bytes = complaint_file.read() if complaint_file is not None else None
     complaint_filename = complaint_file.name if complaint_file is not None else None
+    complaint_mime_type = complaint_file.type if complaint_file is not None else None
 
     with st.spinner(f"Creating case {case_id} and running AI complaint briefing..."):
-        # ---- Drive folder scaffolding is OPTIONAL: skip cleanly if Drive
-        # ---- isn't configured rather than blocking case creation. ----------
+        # ---- Drive folder scaffolding (legacy service-account path) is ----
+        # ---- OPTIONAL: skip cleanly if Drive isn't configured rather ------
+        # ---- than blocking case creation. All actual file uploads below ---
+        # ---- go through the Apps Script "uploadFile" action instead and --
+        # ---- don't need this scaffolding, but it's harmless to keep for --
+        # ---- deployments that still rely on the legacy Pending Review ----
+        # ---- move-file path. ----------------------------------------------
         if drive_service is not None:
             try:
                 create_case_folder_structure(drive_service, case_id)
             except Exception as exc:  # noqa: BLE001
-                st.sidebar.error(f"Case folder creation failed in Drive: {exc}")
-                return
+                st.sidebar.warning(f"Legacy Drive folder scaffolding failed (non-blocking): {exc}")
 
         # ---- Briefing 1: AI Complaint Brief ------------------------------
         # generate_complaint_brief() is fully crash-proof: whether Gemini is
@@ -1266,18 +1438,25 @@ def render_new_case_form(cases_ws, audit_ws, drive_service, model, user):
             filename=complaint_filename,
         )
 
-        # File the raw complaint document itself for the record, if attached
-        # and Drive is available. If not, the AI brief (or its manual
-        # fallback) above still captures what mattered, and the file simply
-        # isn't archived to Drive.
-        if complaint_file_bytes and drive_service is not None:
-            try:
-                layouts_folder_id = get_case_layouts_folder_id(drive_service, case_id)
-                upload_bytes_to_drive_folder(
-                    drive_service, complaint_file_bytes, complaint_filename, layouts_folder_id
+        # ---- Archive the raw complaint document via the Apps Script -------
+        # ---- "uploadFile" action, if one was attached. This is a plain ----
+        # ---- POST of the base64-encoded bytes — no service account -------
+        # ---- needed. Non-fatal on failure: the AI brief (or its manual ----
+        # ---- fallback) above already captured what mattered. ---------------
+        if complaint_file_bytes:
+            complaint_file_url = upload_bytes_via_apps_script(
+                case_id,
+                complaint_file_bytes,
+                complaint_filename,
+                complaint_mime_type,
+                UPLOAD_SUBFOLDER_LAYOUTS,
+            )
+            if complaint_file_url is None:
+                st.sidebar.warning(
+                    "Complaint document could not be archived to Drive, but the "
+                    "case is still being created with the AI complaint brief "
+                    "captured above."
                 )
-            except Exception:  # noqa: BLE001
-                pass  # Non-fatal: the brief already captured what mattered.
 
         case_row = {
             "case_id": case_id,
@@ -1311,8 +1490,8 @@ def render_new_case_form(cases_ws, audit_ws, drive_service, model, user):
         # a missing/broken Gemini key can never prevent the case from being
         # saved. append_case_row() itself now converts this dict into a flat,
         # position-based list (via dict_to_ordered_row(case_row,
-        # CASES_HEADERS)) before it's POSTed, matching Google Sheets'
-        # appendRow() contract.
+        # CASES_HEADERS)) before it's POSTed with action "writeRow",
+        # matching Google Sheets' appendRow() contract.
         try:
             append_case_row(cases_ws, case_row)
         except Exception as exc:  # noqa: BLE001
@@ -1328,13 +1507,7 @@ def render_new_case_form(cases_ws, audit_ws, drive_service, model, user):
             action="Case created (AI complaint brief generated)",
         )
 
-    if drive_service is None:
-        st.sidebar.success(
-            f"Case {case_id} created successfully. (Drive folder scaffolding "
-            "was skipped — connect Drive to enable it.)"
-        )
-    else:
-        st.sidebar.success(f"Case {case_id} created successfully.")
+    st.sidebar.success(f"Case {case_id} created successfully.")
     st.cache_data.clear()
     st.rerun()
 
@@ -1346,19 +1519,24 @@ def render_new_case_form(cases_ws, audit_ws, drive_service, model, user):
 def render_document_checklist_grid(case_row_dict, key_prefix=""):
     """Render the 5-row mandatory-document checklist for one case.
     `case_row_dict` is a plain dict of a single row from HYDRA_Cases (as
-    returned by cases_ws.get_all_records(), or a pandas Series converted via
-    .to_dict()).
+    returned by load_cases(), or a pandas Series converted via .to_dict()).
+
+    Each document's status column (e.g. layout_a_status) now holds either
+    the literal string "Pending" or the full https:// Drive file URL
+    returned by the Apps Script "uploadFile" action. Any value starting
+    with "http" is treated as "uploaded", and rendered as a clickable green
+    "✅ View File" link straight to that URL so the Head/Operator can open
+    the physical file in Drive instantly.
     """
     st.markdown("##### 📑 Document Checklist Grid")
 
     for doc_key in DOCUMENT_TYPE_ORDER:
         config = DOCUMENT_TYPES[doc_key]
         status = str(case_row_dict.get(config["status_col"], "")).strip()
-        link = str(case_row_dict.get(config["link_col"], "")).strip()
         uploader = str(case_row_dict.get(config["uploader_col"], "")).strip()
         department = str(case_row_dict.get(config["department_col"], "")).strip()
 
-        uploaded = status.lower() == "uploaded" and bool(link)
+        uploaded = status.lower().startswith("http")
 
         row_col1, row_col2 = st.columns([2.2, 3])
         with row_col1:
@@ -1374,7 +1552,12 @@ def render_document_checklist_grid(case_row_dict, key_prefix=""):
                 by_line = uploader or "Unknown uploader"
                 if department:
                     by_line += f" · {department}"
-                st.markdown(f"[Open / Preview PDF]({link})  \n*Uploaded by {by_line}*")
+                st.markdown(
+                    f"<a href='{status}' target='_blank' "
+                    f"style='color:#2ca02c;font-weight:600;text-decoration:none;'>"
+                    f"✅ View File</a>  \n*Uploaded by {by_line}*",
+                    unsafe_allow_html=True,
+                )
             else:
                 st.markdown(
                     "<span style='color:#d62728;'>Missing — not yet uploaded</span>",
@@ -1388,10 +1571,10 @@ def render_document_checklist_grid(case_row_dict, key_prefix=""):
 # --------------------------------------------------------------------------------
 
 def process_single_upload(
-    drive_service,
     cases_ws,
     audit_ws,
     unassigned_ws,
+    drive_service,
     filename,
     file_bytes,
     department,
@@ -1400,14 +1583,14 @@ def process_single_upload(
     model=None,
 ):
     """Route one uploaded file: either straight into its case's checklist
-    grid slot, or into Unassigned_Scans for manual triage. If the file is a
-    matched Field Inspection Report, also triggers Briefing 2 (AI Field
-    Findings Brief) and advances the case to 'Inspected'. Returns a short
-    status message string for display in the UI.
-
-    Requires a live `drive_service` — callers must not invoke this when
-    Drive isn't configured (see the guard at the top of
-    render_bulk_upload_auto_sorter)."""
+    grid slot (via the Apps Script "uploadFile" action), or into
+    Unassigned_Scans for manual triage (via the legacy Drive service
+    account, since that path isn't case-scoped). If the file is a matched
+    Field Inspection Report, also triggers Briefing 2 (AI Field Findings
+    Brief) directly on the in-memory bytes and advances the case to
+    'Inspected'. Returns a short status message string for display in the
+    UI, plus a bool indicating success/failure.
+    """
 
     case_id = extract_case_id_from_filename(filename, known_case_ids)
     doc_key = detect_document_type_from_filename(filename)
@@ -1416,52 +1599,74 @@ def process_single_upload(
     matched = bool(case_id) and case_id in known_case_ids and bool(doc_key) and readable_and_clean
 
     if matched:
-        try:
-            folder_id = get_case_layouts_folder_id(drive_service, case_id)
-            file_id, link = upload_bytes_to_drive_folder(
-                drive_service, file_bytes, filename, folder_id
-            )
-        except Exception as exc:  # noqa: BLE001
-            return f"⚠️ '{filename}': Drive upload failed ({exc}); routed to Unassigned_Scans instead.", False
-
-        config = DOCUMENT_TYPES[doc_key]
-        try:
-            update_case_fields(
-                cases_ws,
-                case_id,
-                {
-                    config["status_col"]: "Uploaded",
-                    config["link_col"]: link,
-                    config["uploader_col"]: user["name"],
-                    config["department_col"]: department,
-                },
-            )
-        except ValueError as exc:
-            return f"⚠️ '{filename}': {exc}", False
-
-        append_audit_entry(
-            audit_ws,
-            case_id=case_id,
-            user_name=user["name"],
-            user_role=user["role"],
-            department=department,
-            action=f"Document uploaded: {config['label']} ('{filename}')",
+        mime_type = _guess_mime_type(filename)
+        file_url = upload_bytes_via_apps_script(
+            case_id, file_bytes, filename, mime_type, UPLOAD_SUBFOLDER_LAYOUTS
         )
 
-        result_message = f"✅ '{filename}' → matched to case **{case_id}** as *{config['label']}*."
+        if file_url:
+            config = DOCUMENT_TYPES[doc_key]
+            try:
+                update_case_fields(
+                    cases_ws,
+                    case_id,
+                    {
+                        # The status column now stores the Drive file URL
+                        # directly (checked via "starts with http" in the
+                        # checklist grid) instead of the word "Uploaded".
+                        config["status_col"]: file_url,
+                        config["link_col"]: file_url,
+                        config["uploader_col"]: user["name"],
+                        config["department_col"]: department,
+                    },
+                )
+            except ValueError as exc:
+                return f"⚠️ '{filename}': {exc}", False
 
-        # ---- Briefing 2: Field Inspection Report triggers the AI Field ------
-        # ---- Findings Brief and advances status to 'Inspected'. Fully -------
-        # ---- crash-proof — see apply_field_report_brief_to_case(). ----------
-        if doc_key == "field_report":
-            apply_field_report_brief_to_case(
-                model, cases_ws, audit_ws, case_id, file_bytes, filename, user
+            append_audit_entry(
+                audit_ws,
+                case_id=case_id,
+                user_name=user["name"],
+                user_role=user["role"],
+                department=department,
+                action=f"Document uploaded: {config['label']} ('{filename}')",
             )
-            result_message += " 🤖 Field Findings Brief saved — status advanced to **Inspected**."
 
-        return result_message, True
+            result_message = f"✅ '{filename}' → matched to case **{case_id}** as *{config['label']}*."
 
-    # ---- Unmatched / blurry / unreadable: fall back to Unassigned_Scans ----
+            # ---- Briefing 2: Field Inspection Report triggers the AI --------
+            # ---- Field Findings Brief and advances status to 'Inspected'. ---
+            # ---- Reads the same in-memory `file_bytes` that was just --------
+            # ---- uploaded — no re-download from Drive needed. Fully ---------
+            # ---- crash-proof — see apply_field_report_brief_to_case(). ------
+            if doc_key == "field_report":
+                apply_field_report_brief_to_case(
+                    model, cases_ws, audit_ws, case_id, file_bytes, filename, user
+                )
+                result_message += " 🤖 Field Findings Brief saved — status advanced to **Inspected**."
+
+            return result_message, True
+
+        # Apps Script upload failed for a file that otherwise matched a
+        # case — fall through to Unassigned_Scans below rather than losing
+        # the file entirely.
+        st.warning(
+            f"'{filename}' matched case {case_id} but the upload failed; "
+            "routing to Pending Review instead."
+        )
+
+    # ---- Unmatched / blurry / unreadable / upload-failed: fall back to -----
+    # ---- Unassigned_Scans (still via the legacy Drive service account, -----
+    # ---- since this bucket isn't tied to a specific case's Apps-Script------
+    # ---- managed subfolder). -------------------------------------------------
+    if drive_service is None:
+        return (
+            f"❌ '{filename}': could not be auto-matched, and Google Drive "
+            "(service account) isn't connected to file it to Unassigned_Scans "
+            "for manual review.",
+            False,
+        )
+
     try:
         unassigned_folder_id = get_unassigned_scans_folder_id(drive_service)
         file_id, link = upload_bytes_to_drive_folder(
@@ -1507,18 +1712,24 @@ def process_single_upload(
 def render_bulk_upload_auto_sorter(cases_ws, audit_ws, unassigned_ws, drive_service, model, user):
     st.subheader("📤 Bulk Upload Auto-Sorter")
 
-    if drive_service is None:
-        drive_not_configured_notice()
-        return
-
     st.caption(
         "Upload multiple files at once. Files whose name contains a Case ID "
         "and a recognizable document type (e.g. `HYDRA-20260731-AB12CD_layout_a.pdf` "
         "or `HYDRA-20260731-AB12CD_ghmc.pdf`) are filed straight into that case's "
-        "Document Checklist Grid. A matched Field Inspection Report also triggers "
-        "the AI Field Findings Brief automatically. Anything unmatched, unreadable, "
-        "or too blurry is sent to the Pending Review queue instead."
+        "Document Checklist Grid via the Apps Script uploader. A matched Field "
+        "Inspection Report also triggers the AI Field Findings Brief automatically, "
+        "reading the file in memory. Anything unmatched, unreadable, or too blurry "
+        "is sent to the Pending Review queue instead."
     )
+
+    if drive_service is None:
+        st.info(
+            "📁 Google Drive (service account) isn't connected — matched uploads "
+            "still work via the Apps Script uploader, but any file that can't be "
+            "auto-matched won't be able to reach the Unassigned_Scans / Pending "
+            "Review queue until it's configured.",
+            icon="ℹ️",
+        )
 
     department = st.selectbox("Uploading on behalf of department", UPLOAD_DEPARTMENTS)
     uploaded_files = st.file_uploader(
@@ -1535,10 +1746,10 @@ def render_bulk_upload_auto_sorter(cases_ws, audit_ws, unassigned_ws, drive_serv
             for f in uploaded_files:
                 file_bytes = f.getvalue()
                 message, ok = process_single_upload(
-                    drive_service,
                     cases_ws,
                     audit_ws,
                     unassigned_ws,
+                    drive_service,
                     f.name,
                     file_bytes,
                     department,
@@ -1635,13 +1846,16 @@ def render_pending_review_queue(cases_ws, audit_ws, unassigned_ws, drive_service
                         st.error(f"Could not move file in Drive: {exc}")
                         continue
 
+                    scan_link = scan.get("drive_link", "")
                     try:
                         update_case_fields(
                             cases_ws,
                             target_case_id,
                             {
-                                config["status_col"]: "Uploaded",
-                                config["link_col"]: scan.get("drive_link", ""),
+                                # Status column stores the Drive URL directly,
+                                # same convention as the Bulk Upload path.
+                                config["status_col"]: scan_link,
+                                config["link_col"]: scan_link,
                                 config["uploader_col"]: scan.get("uploader_name", ""),
                                 config["department_col"]: scan.get("uploader_department", ""),
                             },
@@ -1855,14 +2069,12 @@ def render_notice_generator(cases_ws, audit_ws, drive_service, model, user):
     st.caption(
         "Draft a formal HYDRA show-cause notice for cases that have completed field "
         "inspection. Only Head/Approver accounts can approve and sign off; drafting "
-        "does not require sign-off privileges or Google Drive — only the final "
-        "approve-and-file step needs Drive to store the signed PDF. If Gemini is "
-        "unavailable, drafting falls back to an editable manual placeholder so you "
-        "can still write and approve a notice by hand."
+        "does not require sign-off privileges or Google Drive — approval files the "
+        "signed PDF via the Apps Script uploader (Approved_Notices subfolder), no "
+        "service account needed. If Gemini is unavailable, drafting falls back to "
+        "an editable manual placeholder so you can still write and approve a "
+        "notice by hand."
     )
-
-    if drive_service is None:
-        drive_not_configured_notice()
 
     if not REPORTLAB_AVAILABLE or not QRCODE_AVAILABLE:
         st.warning(
@@ -1945,7 +2157,6 @@ def render_notice_generator(cases_ws, audit_ws, drive_service, model, user):
             or (not recipient_name.strip())
             or (not REPORTLAB_AVAILABLE)
             or (not QRCODE_AVAILABLE)
-            or (drive_service is None)
         )
 
         if st.button(
@@ -1958,11 +2169,8 @@ def render_notice_generator(cases_ws, audit_ws, drive_service, model, user):
                 # Server-side role gate — never trust the disabled attribute alone.
                 st.error("Access denied: only Head/Approver roles may approve notices.")
                 return
-            if drive_service is None:
-                st.error("Google Drive isn't connected — approval is disabled until it is.")
-                return
 
-            with st.spinner("Rendering signed notice PDF and filing to Drive..."):
+            with st.spinner("Rendering signed notice PDF and filing it..."):
                 try:
                     pdf_bytes = render_notice_pdf_bytes(
                         case_id, case_row.get("title", ""), edited_draft, recipient_name.strip()
@@ -1971,14 +2179,12 @@ def render_notice_generator(cases_ws, audit_ws, drive_service, model, user):
                     st.error(str(exc))
                     return
 
-                try:
-                    notices_folder_id = get_case_notices_folder_id(drive_service, case_id)
-                    filename = f"{case_id}_Notice.pdf"
-                    file_id, link = upload_bytes_to_drive_folder(
-                        drive_service, pdf_bytes, filename, notices_folder_id
-                    )
-                except Exception as exc:  # noqa: BLE001
-                    st.error(f"Notice PDF was rendered, but saving it to Drive failed: {exc}")
+                filename = f"{case_id}_Notice.pdf"
+                link = upload_bytes_via_apps_script(
+                    case_id, pdf_bytes, filename, "application/pdf", UPLOAD_SUBFOLDER_NOTICES
+                )
+                if link is None:
+                    st.error("Notice PDF was rendered, but saving it via the Apps Script uploader failed.")
                     return
 
                 try:
@@ -2438,10 +2644,11 @@ def main():
                 "🤖 AI briefing/drafting: enabled (Gemini 1.5 Flash) — falls back "
                 "automatically to a manual/default summary if a call ever fails."
             )
+        st.caption("📤 File uploads: via Apps Script uploader (no service account needed)")
         if drive_service is None:
-            st.caption("📁 Google Drive: not connected (add `[gcp_service_account]` to secrets.toml)")
+            st.caption("📁 Legacy Drive service account: not connected (only affects Pending Review moves)")
         else:
-            st.caption("📁 Google Drive: connected")
+            st.caption("📁 Legacy Drive service account: connected")
         if st.button("Log out", use_container_width=True):
             logout()
         st.divider()
