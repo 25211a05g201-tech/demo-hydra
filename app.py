@@ -31,12 +31,19 @@ Single-file Streamlit application implementing:
        (via Bulk Upload or Pending Review), Gemini reads it — including
        handwritten scans — and writes a "Field Findings Brief" into
        "field_report_brief", then advances the case status to "Inspected".
+     Both briefings — and the AI Notice Generator below — are fully
+     crash-proofed: if Gemini is not configured, has a bad/missing API
+     key, or throws any error at call time, the app never stops execution.
+     It shows a mild st.warning() and falls back to a manual/default
+     summary so the case (or field report / notice draft) still saves
+     successfully.
  10. AI Notice Generator with QR Code — for any "Inspected" case, the Head
      can have Gemini draft a formal HYDRA show-cause notice, edit it, and
      (Head-only) approve & sign off. Approval renders a PDF with an
      embedded case-tracking QR code, files it to the case's
      "Approved_Notices/" Drive folder, and advances status to
-     "Notice Served".
+     "Notice Served". Drafting itself is crash-proofed the same way as the
+     two briefings above.
  11. Standalone local utility (no Streamlit/Sheets/Drive dependency) that
      splits one giant combined scanned PDF into separate documents by
      detecting blank/near-blank separator pages.
@@ -169,6 +176,11 @@ SETUP INSTRUCTIONS
 
      # Optional: enables the Dual AI Briefing and AI Notice Generator.
      # Get a key from Google AI Studio (https://aistudio.google.com/app/apikey).
+     # NOTE: this block is genuinely optional now — if it's missing, wrong,
+     # expired, or Gemini errors out at call time, every AI feature falls
+     # back to a manual/default summary instead of blocking the app. See
+     # generate_complaint_brief(), generate_field_report_brief(), and
+     # generate_notice_draft() below.
      [gemini]
      api_key = "your-google-ai-studio-api-key"
 
@@ -410,6 +422,17 @@ ALLOWED_UPLOAD_EXTENSIONS = ["pdf", "jpg", "jpeg", "png"]
 
 GEMINI_MODEL_NAME = "gemini-1.5-flash"
 
+# Shared warning shown by every AI-briefing/drafting fallback path — see the
+# crash-proofing note in the module docstring above.
+AI_FALLBACK_WARNING = (
+    "AI briefing generation failed or is not configured. Saving case with a "
+    "manual/default summary."
+)
+
+# Number of characters kept from raw complaint text when Gemini is
+# unavailable and we fall back to a manual/default complaint_brief.
+MANUAL_BRIEF_TEXT_SLICE_LENGTH = 150
+
 
 # --------------------------------------------------------------------------------
 # GOOGLE API CLIENTS
@@ -464,8 +487,13 @@ def drive_not_configured_notice():
 @st.cache_resource(show_spinner=False)
 def get_gemini_model():
     """Return a configured Gemini 1.5 Flash model, or None if the
-    `google-generativeai` package isn't installed or no API key is configured
-    in secrets.toml. Every caller must handle a None return gracefully."""
+    `google-generativeai` package isn't installed, no API key is configured
+    in secrets.toml, or the client fails to initialize (bad key, network
+    issue, etc). Every caller must handle a None return gracefully — and,
+    on top of that, every caller also wraps its actual `generate_content()`
+    call in its own try/except, since a model object can still be returned
+    here successfully and then fail later at call time (expired/invalid key,
+    quota errors, transient API errors, etc)."""
     if not GEMINI_AVAILABLE:
         return None
     gemini_secrets = st.secrets.get("gemini") if hasattr(st, "secrets") else None
@@ -870,17 +898,39 @@ def is_file_readable_and_clean(filename, file_bytes):
 
 
 # --------------------------------------------------------------------------------
-# DUAL AI BRIEFING (Gemini 1.5 Flash)
+# DUAL AI BRIEFING (Gemini 1.5 Flash) — CRASH-PROOF
 # --------------------------------------------------------------------------------
+# Every function in this section follows the same contract:
+#   - It NEVER raises. Any failure (Gemini not installed, no API key, bad
+#     key, network error, quota error, empty response, etc.) is caught here.
+#   - On failure it shows a single, mild st.warning() with the exact text
+#     "AI briefing generation failed or is not configured. Saving case with
+#     a manual/default summary." (AI_FALLBACK_WARNING), then returns a
+#     manual/default string instead of AI-generated text.
+#   - Callers (case creation, bulk upload, pending review, notice
+#     generation) can therefore always trust that these functions return
+#     *something* usable and keep going straight to writing to the Google
+#     Sheet — AI availability never blocks a save.
 
 def generate_complaint_brief(model, raw_text=None, file_bytes=None, filename=None):
     """Briefing 1: read the raw complaint text and/or an attached complaint
     document (PDF or image) and return a structured summary suitable for the
-    case's `complaint_brief` field. Returns a placeholder string (never
-    raises) if Gemini isn't configured or the call fails, so case creation
-    never blocks on the AI step."""
+    case's `complaint_brief` field.
+
+    Crash-proof fallback: if Gemini isn't configured, or the API call fails
+    for any reason (missing/invalid credentials, network error, quota, empty
+    response, etc.), show a mild warning and fall back to the first
+    MANUAL_BRIEF_TEXT_SLICE_LENGTH characters of the raw complaint text —
+    case creation always proceeds and the row is still written to the sheet.
+    """
+    raw_text = raw_text or ""
+    manual_fallback = raw_text.strip()[:MANUAL_BRIEF_TEXT_SLICE_LENGTH] or (
+        "[No complaint text provided — manual review required]"
+    )
+
     if model is None:
-        return (raw_text or "").strip() or "[AI briefing unavailable: Gemini not configured]"
+        st.warning(AI_FALLBACK_WARNING)
+        return manual_fallback
 
     instruction = (
         "You are assisting a HYDRA (Hyderabad Disaster Response and Asset Protection "
@@ -895,24 +945,39 @@ def generate_complaint_brief(model, raw_text=None, file_bytes=None, filename=Non
     parts = [instruction]
     if file_bytes and filename:
         parts.append({"mime_type": _guess_mime_type(filename), "data": file_bytes})
-    if raw_text and raw_text.strip():
+    if raw_text.strip():
         parts.append(f"Complaint text:\n{raw_text.strip()}")
 
     try:
         response = model.generate_content(parts)
         text = (getattr(response, "text", "") or "").strip()
-        return text or "[AI briefing returned no content]"
-    except Exception as exc:  # noqa: BLE001
-        return f"[AI briefing unavailable: {exc}]"
+        if not text:
+            raise ValueError("Gemini returned an empty response")
+        return text
+    except Exception:  # noqa: BLE001 — any Gemini/credential/network error lands here
+        st.warning(AI_FALLBACK_WARNING)
+        return manual_fallback
 
 
 def generate_field_report_brief(model, file_bytes, filename):
     """Briefing 2: read a Field Inspection Report file (typed or handwritten
-    scan, PDF or image) and return a concise 'Field Findings Brief'. Returns
-    a placeholder string (never raises) if Gemini isn't configured or the
-    call fails."""
+    scan, PDF or image) and return a concise 'Field Findings Brief'.
+
+    Crash-proof fallback: if Gemini isn't configured, or the API call fails
+    for any reason, show a mild warning and fall back to a manual/default
+    summary noting the file was received and needs manual review — the
+    upload/assignment flow always proceeds and the checklist grid is still
+    updated.
+    """
+    manual_fallback = (
+        f"[Manual review required] Field Inspection Report '{filename}' was "
+        "received, but an AI-generated Field Findings Brief could not be produced. "
+        "An officer should review the attached file directly."
+    )
+
     if model is None:
-        return "[AI briefing unavailable: Gemini not configured]"
+        st.warning(AI_FALLBACK_WARNING)
+        return manual_fallback
 
     instruction = (
         "You are assisting a HYDRA (Hyderabad Disaster Response and Asset Protection "
@@ -930,17 +995,21 @@ def generate_field_report_brief(model, file_bytes, filename):
     try:
         response = model.generate_content(parts)
         text = (getattr(response, "text", "") or "").strip()
-        return text or "[AI briefing returned no content]"
-    except Exception as exc:  # noqa: BLE001
-        return f"[AI briefing unavailable: {exc}]"
+        if not text:
+            raise ValueError("Gemini returned an empty response")
+        return text
+    except Exception:  # noqa: BLE001 — any Gemini/credential/network error lands here
+        st.warning(AI_FALLBACK_WARNING)
+        return manual_fallback
 
 
 def apply_field_report_brief_to_case(model, cases_ws, audit_ws, case_id, file_bytes, filename, user):
     """Run Briefing 2 for a case's Field Inspection Report, save the result
     into `field_report_brief`, and advance status to 'Inspected' unless the
     case has already progressed past that point (e.g. Closed / Notice
-    Served). Never raises — failures are surfaced via the audit log /
-    Streamlit warnings instead of blocking the upload flow."""
+    Served). Never raises — failures are surfaced via st.warning() /
+    generate_field_report_brief()'s own fallback instead of blocking the
+    upload flow, and the checklist/status update always still runs."""
     brief_text = generate_field_report_brief(model, file_bytes, filename)
 
     updates = {"field_report_brief": brief_text}
@@ -1107,7 +1176,13 @@ def render_new_case_form(cases_ws, audit_ws, drive_service, model, user):
                 st.sidebar.error(f"Case folder creation failed in Drive: {exc}")
                 return
 
-        # ---- Briefing 1: AI Complaint Brief -----------------------------------
+        # ---- Briefing 1: AI Complaint Brief ------------------------------
+        # generate_complaint_brief() is fully crash-proof: whether Gemini is
+        # unconfigured, mis-configured, or throws at call time, it shows a
+        # mild st.warning() itself and returns a manual/default summary
+        # (first ~150 characters of the raw complaint text) instead of
+        # raising. Case creation below always proceeds regardless of AI
+        # availability.
         complaint_brief_text = generate_complaint_brief(
             model,
             raw_text=complaint_raw_text,
@@ -1116,8 +1191,9 @@ def render_new_case_form(cases_ws, audit_ws, drive_service, model, user):
         )
 
         # File the raw complaint document itself for the record, if attached
-        # and Drive is available. If not, the AI brief above still captures
-        # what mattered, and the file simply isn't archived to Drive.
+        # and Drive is available. If not, the AI brief (or its manual
+        # fallback) above still captures what mattered, and the file simply
+        # isn't archived to Drive.
         if complaint_file_bytes and drive_service is not None:
             try:
                 layouts_folder_id = get_case_layouts_folder_id(drive_service, case_id)
@@ -1125,7 +1201,7 @@ def render_new_case_form(cases_ws, audit_ws, drive_service, model, user):
                     drive_service, complaint_file_bytes, complaint_filename, layouts_folder_id
                 )
             except Exception:  # noqa: BLE001
-                pass  # Non-fatal: the AI brief already captured what mattered.
+                pass  # Non-fatal: the brief already captured what mattered.
 
         case_row = {
             "case_id": case_id,
@@ -1147,6 +1223,12 @@ def render_new_case_form(cases_ws, audit_ws, drive_service, model, user):
             "created_at": datetime.utcnow().isoformat(timespec="seconds") + "Z",
         }
 
+        # ---- Write the case row to the Google Sheet -----------------------
+        # This step is intentionally independent of AI availability: by the
+        # time we get here, complaint_brief_text is always a valid string
+        # (either Gemini's output or the manual/default fallback above), so
+        # a missing/broken Gemini key can never prevent the case from being
+        # saved.
         try:
             append_case_row(cases_ws, case_row)
         except Exception as exc:  # noqa: BLE001
@@ -1285,12 +1367,13 @@ def process_single_upload(
         result_message = f"✅ '{filename}' → matched to case **{case_id}** as *{config['label']}*."
 
         # ---- Briefing 2: Field Inspection Report triggers the AI Field ------
-        # ---- Findings Brief and advances status to 'Inspected'. -------------
+        # ---- Findings Brief and advances status to 'Inspected'. Fully -------
+        # ---- crash-proof — see apply_field_report_brief_to_case(). ----------
         if doc_key == "field_report":
             apply_field_report_brief_to_case(
                 model, cases_ws, audit_ws, case_id, file_bytes, filename, user
             )
-            result_message += " 🤖 AI Field Findings Brief generated — status advanced to **Inspected**."
+            result_message += " 🤖 Field Findings Brief saved — status advanced to **Inspected**."
 
         return result_message, True
 
@@ -1509,6 +1592,7 @@ def render_pending_review_queue(cases_ws, audit_ws, unassigned_ws, drive_service
                     )
 
                     # ---- Briefing 2 also fires from manual assignment --------
+                    # (fully crash-proof — see apply_field_report_brief_to_case)
                     if doc_key == "field_report":
                         try:
                             drive_file_id = scan.get("drive_file_id", "")
@@ -1549,13 +1633,29 @@ def render_pending_review_queue(cases_ws, audit_ws, unassigned_ws, drive_service
 
 def generate_notice_draft(model, case_row, recipient_name, recipient_address, violation_details):
     """Draft a formal HYDRA show-cause notice using Gemini, following the
-    standard HYDRA legal notice structure. Returns a placeholder string
-    (never raises) if Gemini isn't configured or the call fails."""
+    standard HYDRA legal notice structure.
+
+    Crash-proof fallback: if Gemini isn't configured, or the API call fails
+    for any reason, show a mild warning and fall back to a manual/default
+    placeholder draft built from the fields the Head already typed in — the
+    Head can still edit and (once a real draft is written manually) approve
+    and sign off the notice; drafting failures never block the workflow.
+    """
+    manual_fallback = (
+        "[MANUAL DRAFT REQUIRED — AI drafting unavailable]\n\n"
+        f"Case ID: {case_row.get('case_id', '')}\n"
+        f"Case Title: {case_row.get('title', '')}\n"
+        f"Date: {date.today().isoformat()}\n\n"
+        f"To: {recipient_name}\n"
+        f"Address: {recipient_address}\n\n"
+        f"Violation details / grounds for notice:\n{violation_details}\n\n"
+        "Please replace this placeholder with a formally drafted HYDRA "
+        "show-cause notice before approving and signing off."
+    )
+
     if model is None:
-        return (
-            "[AI drafting unavailable: Gemini is not configured. Please draft this "
-            "notice manually before approving.]"
-        )
+        st.warning(AI_FALLBACK_WARNING)
+        return manual_fallback
 
     prompt = f"""You are drafting an official HYDRA (Hyderabad Disaster Response and Asset
 Protection Agency) show-cause notice, following the standard HYDRA legal notice
@@ -1591,9 +1691,12 @@ notice."""
     try:
         response = model.generate_content(prompt)
         text = (getattr(response, "text", "") or "").strip()
-        return text or "[AI drafting returned no content]"
-    except Exception as exc:  # noqa: BLE001
-        return f"[AI drafting unavailable: {exc}]"
+        if not text:
+            raise ValueError("Gemini returned an empty response")
+        return text
+    except Exception:  # noqa: BLE001 — any Gemini/credential/network error lands here
+        st.warning(AI_FALLBACK_WARNING)
+        return manual_fallback
 
 
 def render_notice_pdf_bytes(case_id, case_title, notice_text, recipient_name):
@@ -1669,7 +1772,9 @@ def render_notice_generator(cases_ws, audit_ws, drive_service, model, user):
         "Draft a formal HYDRA show-cause notice for cases that have completed field "
         "inspection. Only Head/Approver accounts can approve and sign off; drafting "
         "does not require sign-off privileges or Google Drive — only the final "
-        "approve-and-file step needs Drive to store the signed PDF."
+        "approve-and-file step needs Drive to store the signed PDF. If Gemini is "
+        "unavailable, drafting falls back to an editable manual placeholder so you "
+        "can still write and approve a notice by hand."
     )
 
     if drive_service is None:
@@ -1723,7 +1828,7 @@ def render_notice_generator(cases_ws, audit_ws, drive_service, model, user):
         if not recipient_name.strip() or not violation_details.strip():
             st.error("Recipient name and violation details are required to draft a notice.")
         else:
-            with st.spinner("Drafting notice with Gemini..."):
+            with st.spinner("Drafting notice..."):
                 draft = generate_notice_draft(
                     model, case_row, recipient_name.strip(), recipient_address.strip(), violation_details.strip()
                 )
@@ -2222,7 +2327,7 @@ def main():
 
     user = st.session_state.user
     drive_service = get_drive_service()  # may be None — every caller below handles that
-    model = get_gemini_model()
+    model = get_gemini_model()  # may be None — every AI-briefing/drafting call below handles that
 
     # Log the login event once per session.
     if not st.session_state.get("login_logged"):
@@ -2240,9 +2345,15 @@ def main():
         st.markdown(f"**{user['name']}**  \n{user['email']}")
         st.markdown(f"Role: `{user['role']}` · Dept: `{user['department']}`")
         if model is None:
-            st.caption("🤖 AI briefing/drafting: not configured (add `[gemini] api_key` to secrets.toml)")
+            st.caption(
+                "🤖 AI briefing/drafting: not configured (add `[gemini] api_key` to "
+                "secrets.toml) — cases still save normally with a manual/default summary."
+            )
         else:
-            st.caption("🤖 AI briefing/drafting: enabled (Gemini 1.5 Flash)")
+            st.caption(
+                "🤖 AI briefing/drafting: enabled (Gemini 1.5 Flash) — falls back "
+                "automatically to a manual/default summary if a call ever fails."
+            )
         if drive_service is None:
             st.caption("📁 Google Drive: not connected (add `[gcp_service_account]` to secrets.toml)")
         else:
